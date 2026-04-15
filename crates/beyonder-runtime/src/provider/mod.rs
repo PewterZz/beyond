@@ -1,6 +1,6 @@
 //! LLM provider backends. The `AgentBackend` trait unifies ACP subprocesses
-//! and direct Ollama calls so the supervisor's drive_turn loop stays
-//! backend-agnostic.
+//! and direct Ollama/OpenAI-compat calls so the supervisor's drive_turn loop
+//! stays backend-agnostic.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,6 +8,38 @@ use beyonder_acp::client::StreamPause;
 
 pub mod ollama;
 pub use ollama::{OllamaBackend, OllamaConfig, ToolDescriptor};
+
+pub mod openai_compat;
+pub use openai_compat::{OpenAICompatBackend, OpenAICompatConfig};
+
+/// Build the system prompt injected as `messages[0]` for all LLM backends.
+/// Kept here so Ollama and OpenAI-compat back-ends stay in sync.
+pub fn build_system_prompt(cwd: &std::path::Path, tools: &[ToolDescriptor]) -> String {
+    let tool_list = tools
+        .iter()
+        .map(|t| format!("  - `{}`: {}", t.name, t.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are Beyond — an AI coding agent embedded inside an agent-native terminal built in Rust.\n\
+You run directly on the user's machine with full access to their local environment.\n\
+\n\
+Current working directory: {cwd}\n\
+\n\
+You have access to the following tools:\n\
+{tool_list}\n\
+\n\
+Use tools proactively: run shell commands to read files, inspect output, run tests, \
+check git status, install dependencies, and execute code. You can accomplish almost \
+any coding task by composing shell commands.\n\
+\n\
+Be direct and concise. Use markdown formatting in your responses (headings, bold, \
+code blocks). When writing code, always use fenced code blocks with the language tag.",
+        cwd = cwd.display(),
+        tool_list = tool_list,
+    )
+}
 
 /// Uniform turn-driving interface.
 #[async_trait]

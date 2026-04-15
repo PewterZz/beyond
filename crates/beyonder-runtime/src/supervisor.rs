@@ -11,7 +11,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::provider::{AgentBackend, ollama::{OllamaBackend, OllamaConfig, ToolDescriptor}};
+use crate::provider::{
+    AgentBackend,
+    ollama::{OllamaBackend, OllamaConfig, ToolDescriptor},
+    openai_compat::{OpenAICompatBackend, OpenAICompatConfig},
+};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{ToolContext, ToolOutput};
 
@@ -98,6 +102,32 @@ impl AgentSupervisor {
                     })
                     .collect();
                 Box::new(OllamaBackend::new(config, event_tx, tool_descs, cwd.clone()))
+            }
+            AgentKind::LlamaCpp { base_url, model, api_key_env } => {
+                let api_key = api_key_env.as_deref()
+                    .and_then(|env| std::env::var(env).ok());
+                let config = OpenAICompatConfig { base_url: base_url.clone(), model: model.clone(), api_key };
+                let tool_descs: Vec<ToolDescriptor> = registry.all_tools()
+                    .map(|t| ToolDescriptor {
+                        name: t.name().to_string(),
+                        description: t.description().to_string(),
+                        schema: t.input_schema(),
+                    })
+                    .collect();
+                Box::new(OpenAICompatBackend::new(config, event_tx, tool_descs, cwd.clone()))
+            }
+            AgentKind::Mlx { base_url, model, api_key_env } => {
+                let api_key = api_key_env.as_deref()
+                    .and_then(|env| std::env::var(env).ok());
+                let config = OpenAICompatConfig { base_url: base_url.clone(), model: model.clone(), api_key };
+                let tool_descs: Vec<ToolDescriptor> = registry.all_tools()
+                    .map(|t| ToolDescriptor {
+                        name: t.name().to_string(),
+                        description: t.description().to_string(),
+                        schema: t.input_schema(),
+                    })
+                    .collect();
+                Box::new(OpenAICompatBackend::new(config, event_tx, tool_descs, cwd.clone()))
             }
             _ => anyhow::bail!("Unsupported agent kind in MVP"),
         };

@@ -74,6 +74,21 @@ pub enum AgentKind {
         /// Env var that holds the bearer token (e.g. "OLLAMA_API_KEY"). None for local.
         api_key_env: Option<String>,
     },
+    /// llama.cpp llama-server with OpenAI-compatible /v1/chat/completions endpoint.
+    /// Requires the server to be started with `--jinja` for reliable tool calling.
+    LlamaCpp {
+        base_url: String,
+        model: String,
+        /// Optional env var for auth (e.g. when fronted by a reverse proxy).
+        api_key_env: Option<String>,
+    },
+    /// Apple MLX mlx_lm.server with OpenAI-compatible /v1/chat/completions endpoint.
+    /// Requires mlx-lm >= 0.19 for tool calling support.
+    Mlx {
+        base_url: String,
+        model: String,
+        api_key_env: Option<String>,
+    },
     /// A WASM component plugin (post-MVP).
     WasmPlugin { module_path: String },
     /// Built-in agent (system-level operations).

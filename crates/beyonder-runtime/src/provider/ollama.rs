@@ -113,34 +113,9 @@ impl OllamaBackend {
             })
             .collect();
 
-        let tool_list = tools
-            .iter()
-            .map(|t| format!("  - `{}`: {}", t.name, t.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_content = format!(
-            "You are Beyond — an AI coding agent embedded inside an agent-native terminal built in Rust.\n\
-You run directly on the user's machine with full access to their local environment.\n\
-\n\
-Current working directory: {cwd}\n\
-\n\
-You have access to the following tools:\n\
-{tool_list}\n\
-\n\
-Use tools proactively: run shell commands to read files, inspect output, run tests, \
-check git status, install dependencies, and execute code. You can accomplish almost \
-any coding task by composing shell commands.\n\
-\n\
-Be direct and concise. Use markdown formatting in your responses (headings, bold, \
-code blocks). When writing code, always use fenced code blocks with the language tag.",
-            cwd = cwd.display(),
-            tool_list = tool_list,
-        );
-
         let system_msg = OllamaMessage {
             role: "system".to_string(),
-            content: system_content,
+            content: super::build_system_prompt(&cwd, &tools),
             tool_calls: None,
             name: None,
         };

@@ -5,7 +5,7 @@ use beyonder_core::{
     AgentKind, Block, BlockContent, BlockKind, BlockStatus, CapabilitySet, Session,
     TerminalCell, TerminalOutput, TerminalRow,
 };
-use beyonder_config::BeyonderConfig;
+use beyonder_config::{BeyonderConfig, ProviderConfig};
 use beyonder_gpu::Renderer;
 use beyonder_acp::client::AgentEvent;
 use beyonder_runtime::{
@@ -320,7 +320,7 @@ impl App {
         };
 
         let active_model = config.model.clone();
-        let active_provider = config.provider.clone();
+        let active_provider = config.provider.name().to_string();
 
         Ok(Self {
             renderer,
@@ -817,16 +817,30 @@ impl App {
             let caps = CapabilitySet::default_coding_agent(
                 self.session.working_directory.clone(),
             );
-            let kind = if self.active_provider == "ollama" {
-                let (base_url, api_key_env) = if std::env::var("OLLAMA_API_KEY").is_ok() {
-                    ("https://ollama.com".to_string(), Some("OLLAMA_API_KEY".to_string()))
-                } else {
-                    ("http://localhost:11434".to_string(), None)
-                };
-                AgentKind::Ollama { base_url, model: self.active_model.clone(), api_key_env }
-            } else {
-                let binary = name.to_string();
-                AgentKind::AcpProcess { binary, args: vec![] }
+            let kind = match &self.config.provider {
+                ProviderConfig::Ollama { base_url, api_key_env } => {
+                    // Env var takes precedence over config for cloud detection.
+                    let (base_url, api_key_env) = if std::env::var("OLLAMA_API_KEY").is_ok() {
+                        ("https://ollama.com".to_string(), Some("OLLAMA_API_KEY".to_string()))
+                    } else {
+                        (base_url.clone(), api_key_env.clone())
+                    };
+                    AgentKind::Ollama { base_url, model: self.active_model.clone(), api_key_env }
+                }
+                ProviderConfig::LlamaCpp { base_url, api_key_env } => {
+                    AgentKind::LlamaCpp {
+                        base_url: base_url.clone(),
+                        model: self.active_model.clone(),
+                        api_key_env: api_key_env.clone(),
+                    }
+                }
+                ProviderConfig::Mlx { base_url, api_key_env } => {
+                    AgentKind::Mlx {
+                        base_url: base_url.clone(),
+                        model: self.active_model.clone(),
+                        api_key_env: api_key_env.clone(),
+                    }
+                }
             };
             match self
                 .supervisor
@@ -935,8 +949,15 @@ impl App {
                 self.push_text_block(format!("Current model: {}", self.active_model));
             }
             ["/provider", name] => {
+                // Preserve existing base_url if the provider kind hasn't changed;
+                // otherwise fall back to the default URL for the new provider.
+                let new_provider = if self.config.provider.name() == *name {
+                    self.config.provider.clone()
+                } else {
+                    ProviderConfig::from_name(name)
+                };
                 self.active_provider = name.to_string();
-                self.config.provider = name.to_string();
+                self.config.provider = new_provider;
                 if let Err(e) = self.config.save() {
                     warn!("Failed to save config: {e}");
                 }

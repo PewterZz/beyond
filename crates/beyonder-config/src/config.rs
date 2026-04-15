@@ -1,6 +1,83 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Which LLM backend to use and its connection parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    /// Ollama — local (localhost:11434) or cloud (ollama.com Turbo/Pro).
+    Ollama {
+        #[serde(default = "default_ollama_base_url")]
+        base_url: String,
+        /// Env var holding the bearer token for cloud. None = local.
+        #[serde(default)]
+        api_key_env: Option<String>,
+    },
+    /// llama.cpp llama-server with `--jinja` and an OpenAI-compat `/v1` endpoint.
+    LlamaCpp {
+        #[serde(default = "default_local_v1_url")]
+        base_url: String,
+        /// Optional env var for auth if the server is fronted by a reverse proxy.
+        #[serde(default)]
+        api_key_env: Option<String>,
+    },
+    /// Apple MLX mlx_lm.server (mlx-lm >= 0.19 recommended).
+    Mlx {
+        #[serde(default = "default_local_v1_url")]
+        base_url: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+    },
+}
+
+fn default_ollama_base_url() -> String { "http://localhost:11434".to_string() }
+fn default_local_v1_url() -> String { "http://127.0.0.1:8080/v1".to_string() }
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        // Respect OLLAMA_API_KEY at default-construction time so the cloud
+        // backend activates automatically when the env var is present.
+        if std::env::var("OLLAMA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            ProviderConfig::Ollama {
+                base_url: "https://ollama.com".to_string(),
+                api_key_env: Some("OLLAMA_API_KEY".to_string()),
+            }
+        } else {
+            ProviderConfig::Ollama {
+                base_url: default_ollama_base_url(),
+                api_key_env: None,
+            }
+        }
+    }
+}
+
+impl ProviderConfig {
+    /// Short lowercase name used as the agent name and for display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ProviderConfig::Ollama { .. } => "ollama",
+            ProviderConfig::LlamaCpp { .. } => "llama_cpp",
+            ProviderConfig::Mlx { .. } => "mlx",
+        }
+    }
+
+    /// Construct a ProviderConfig from a short name string, using sensible
+    /// defaults. Used by the `/provider` runtime command.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "llama_cpp" => ProviderConfig::LlamaCpp {
+                base_url: default_local_v1_url(),
+                api_key_env: None,
+            },
+            "mlx" => ProviderConfig::Mlx {
+                base_url: default_local_v1_url(),
+                api_key_env: None,
+            },
+            _ => ProviderConfig::default(),
+        }
+    }
+}
+
 /// Top-level Beyonder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeyonderConfig {
@@ -10,12 +87,11 @@ pub struct BeyonderConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_model")]
     pub model: String,
-    #[serde(default = "default_provider")]
-    pub provider: String,
+    #[serde(default)]
+    pub provider: ProviderConfig,
 }
 
 fn default_model() -> String { "qwen2.5-coder:7b".to_string() }
-fn default_provider() -> String { "ollama".to_string() }
 
 impl Default for BeyonderConfig {
     fn default() -> Self {
@@ -25,7 +101,7 @@ impl Default for BeyonderConfig {
             shell: ShellConfig::default(),
             data_dir: default_data_dir(),
             model: default_model(),
-            provider: default_provider(),
+            provider: ProviderConfig::default(),
         }
     }
 }

@@ -1,3 +1,3 @@
 pub mod config;
 
-pub use config::BeyonderConfig;
+pub use config::{BeyonderConfig, ProviderConfig};
