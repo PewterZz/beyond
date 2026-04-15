@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Renamed the user-facing product from "Beyonder" to "Beyond" (window title, ACP client identity, `TERM_PROGRAM`, agent system prompt, slash-command text). Internal crate and type names remain `beyonder_*`.
-- Added `LICENSE`, `README.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and this changelog.
+- Added `LICENSE` (GPL-3.0-or-later), `README.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and this changelog.
 
 ## [0.1.0] — Phase 2
 

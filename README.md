@@ -72,4 +72,4 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`CODE_OF_CONDUCT.md`](./CODE_OF_
 
 ## License
 
-MIT. See [`LICENSE`](./LICENSE).
+GPL-3.0-or-later. See [`LICENSE`](./LICENSE).

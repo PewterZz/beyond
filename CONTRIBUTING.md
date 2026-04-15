@@ -5,7 +5,7 @@ Thanks for your interest in Beyond! This document covers the practical mechanics
 ## Ground rules
 
 - Be respectful. See [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
-- By contributing, you agree your work is licensed under the project's MIT license.
+- By contributing, you agree your work is licensed under the project's GPL-3.0-or-later license.
 - Security issues: please **do not** open a public issue — see [`SECURITY.md`](./SECURITY.md).
 
 ## Getting set up

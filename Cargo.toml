@@ -21,7 +21,7 @@ edition.workspace = true
 version = "0.1.0"
 edition = "2021"
 authors = ["Beyonder Contributors"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 # Core
