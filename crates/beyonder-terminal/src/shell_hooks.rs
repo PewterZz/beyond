@@ -46,9 +46,9 @@ unsetopt PROMPT_CR
 
 beyonder_preexec() {{
     local cmd="$1"
-    printf '\033]133;C\007'
     printf '\033]633;A\007'
     printf '\033]633;E;%s\007' "$cmd"
+    printf '\033]133;C\007'
 }}
 
 beyonder_precmd() {{
@@ -74,9 +74,9 @@ pub fn bash_init_script(session_id: &str) -> String {
 export BEYONDER_SESSION_ID="{session_id}"
 
 beyonder_preexec() {{
-    printf '\033]133;C\007'
     printf '\033]633;A\007'
     printf '\033]633;E;%s\007' "$1"
+    printf '\033]133;C\007'
 }}
 
 beyonder_precmd() {{
@@ -101,9 +101,9 @@ pub fn fish_init_script(session_id: &str) -> String {
 set -gx BEYONDER_SESSION_ID "{session_id}"
 
 function __beyonder_preexec --on-event fish_preexec
-    printf '\e]133;C\a'
     printf '\e]633;A\a'
     printf '\e]633;E;%s\a' $argv[1]
+    printf '\e]133;C\a'
 end
 
 function __beyonder_postexec --on-event fish_postexec
@@ -132,9 +132,9 @@ $env.config = ($env.config? | default {{}})
 $env.config.hooks = ($env.config.hooks? | default {{}})
 
 let __beyonder_pre_exec = {{|cmd|
-    print -n $"(char esc)]133;C(char bel)"
     print -n $"(char esc)]633;A(char bel)"
     print -n $"(char esc)]633;E;($cmd)(char bel)"
+    print -n $"(char esc)]133;C(char bel)"
 }}
 
 let __beyonder_pre_prompt = {{||
