@@ -22,7 +22,7 @@ cargo fmt --all
 
 Logging is via `tracing`. Control with `RUST_LOG` (default: `beyonder=info,wgpu_core=warn,wgpu_hal=warn`). Logs go to **stderr**; redirect with `cargo run 2> run.log` (stdout is buffered and will hide hangs).
 
-Ollama is the sole LLM provider (local + Turbo share one backend). Ensure `ollama serve` is running before spawning agents.
+Three LLM providers are supported: **Ollama** (local + Turbo), **llama.cpp** (`llama-server`), and **Apple MLX** (`mlx_lm.server`). The active provider is set in `config.toml` or at runtime with `/provider <name>`. Ensure the relevant server is running before spawning agents.
 
 ## Workspace Layout
 
@@ -32,10 +32,10 @@ Workspace root builds the `beyonder` binary (`src/main.rs`) which is a thin wini
 - **beyonder-store** — SQLite persistence (`rusqlite`, bundled). `BlockStore`, `SessionStore`, migrations. The `Store` wraps a single `Connection`.
 - **beyonder-terminal** — PTY management (`portable-pty`) and terminal emulation (`alacritty_terminal`). `PtySession`, `TermGrid`, `BlockBuilder` turns raw PTY output into shell blocks via OSC-133 shell hooks.
 - **beyonder-acp** — Agent Client Protocol: messages, transport, `AcpClient`. Streaming events from agent backends.
-- **beyonder-runtime** — `AgentSupervisor` spawns and monitors agents; `CapabilityBroker` gates tool use; `tools::` registry executes tool calls; `provider::` holds the `AgentBackend` trait and `OllamaBackend` implementation. Runtime is where the async turn-drivers live (one tokio task per agent, driven via `mpsc` command channels).
+- **beyonder-runtime** — `AgentSupervisor` spawns and monitors agents; `CapabilityBroker` gates tool use; `tools::` registry executes tool calls; `provider::` holds the `AgentBackend` trait, `OllamaBackend` (NDJSON), and `OpenAICompatBackend` (SSE, used by both llama.cpp and MLX). Runtime is where the async turn-drivers live (one tokio task per agent, driven via `mpsc` command channels).
 - **beyonder-gpu** — wgpu 24 renderer. `Renderer` owns the device/queue/surface and text atlas (glyphon 0.8). `Viewport` handles scrolling. Per-block renderers live in `block_renderers/` (agent_message, approval, shell_block, etc.).
 - **beyonder-ui** — the `App` struct: wires supervisor, store, renderer, input editor, history, mode detector, commands. `App::tick()` (called from `about_to_wait`) drains supervisor/broker events so streaming works even when the window is occluded. `App::handle_window_event` + `App::render` are called from `window_event`.
-- **beyonder-config** — `BeyonderConfig` loaded from TOML.
+- **beyonder-config** — `BeyonderConfig` + `ProviderConfig` enum loaded from TOML.
 
 ## Runtime Loop (important)
 
@@ -51,6 +51,32 @@ Do **not** move state-advancement into `RedrawRequested` — macOS suppresses re
 - A `Block` has `id` (ULID), `kind`, optional `parent_id` / `agent_id`, `session_id`, timestamps, `status` (Pending/…), `content`, and a `ProvenanceChain`. Blocks are immutable append-only except for status/`updated_at`; new content = new block with `parent_id`.
 - Agents have `AgentState` (Spawning/…), `CapabilitySet` (what tools they may invoke), and `ResourceLimits`. The `AgentSupervisor` owns an `AgentHandle` per agent with an `mpsc::UnboundedSender<AgentCmd>` (`Prompt` / `ResetConversation`). Events flow back via `SupervisorEvent`.
 - Tool execution goes through `CapabilityBroker` — never bypass it.
+
+## Provider Configuration
+
+`ProviderConfig` is a tagged TOML enum in `beyonder-config/src/config.rs`. Three variants:
+
+```toml
+# Ollama (default)
+[provider]
+kind = "ollama"
+base_url = "http://localhost:11434"   # optional; cloud: "https://ollama.com"
+api_key_env = "OLLAMA_API_KEY"        # optional; omit for local
+
+# llama.cpp — start server with: llama-server -m model.gguf --jinja -c 8192
+[provider]
+kind = "llama_cpp"
+base_url = "http://127.0.0.1:8080/v1"
+
+# Apple MLX — requires mlx-lm >= 0.19; start with: mlx_lm.server --model <id>
+[provider]
+kind = "mlx"
+base_url = "http://127.0.0.1:8080/v1"
+```
+
+Switch at runtime with `/provider ollama|llama_cpp|mlx` (saves to config). Switch model with `/model <name>`. Both take effect on the next agent spawn — use `/clear` or restart to respawn with new settings if an agent is already running.
+
+`OpenAICompatBackend` (`provider/openai_compat.rs`) handles both llama.cpp and MLX. Key differences from Ollama: SSE framing, tool-call arguments arrive as string fragments that are reassembled before JSON parsing, tool result messages use `tool_call_id` instead of `name`.
 
 ## Conventions
 

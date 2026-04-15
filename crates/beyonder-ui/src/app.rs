@@ -1150,10 +1150,13 @@ impl App {
                             self.push_tool_call_block(&agent_id, id, name, input);
                         }
                         AgentEvent::ToolResult { id, name: _, output, is_error } => {
-                            // Don't clear agent_running_tool here — the LLM hasn't
-                            // resumed yet. Keep the spinner/tool label visible until
-                            // the next TextDelta or ToolCallRequested arrives.
                             self.complete_tool_call_block(&id, output, is_error);
+                            // Push a new empty Running agent block so the spinner stays
+                            // visible while we wait for the LLM to resume. The tool name
+                            // in agent_running_tool (not cleared here) keeps the label
+                            // showing. finalize_agent_block will drop this block if it's
+                            // still empty when the next ToolCallRequested fires.
+                            self.push_pending_agent_block(agent_id.clone());
                         }
                         AgentEvent::TurnComplete { ref stop_reason } => {
                             info!(%agent_id, %stop_reason, "ui: TurnComplete received");
