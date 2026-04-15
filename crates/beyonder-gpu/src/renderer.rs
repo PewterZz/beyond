@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use beyonder_core::{Block, BlockContent, BlockKind, BlockStatus, TuiCell, UnderlineStyle};
 use glyphon::{
-    Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphColor, ColorMode, Family, FontSystem,
-    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
-    Viewport as GlyphViewport,
+    Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphColor, ColorMode, Cursor as TextCursor,
+    Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport as GlyphViewport,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,6 +37,50 @@ const GAP: f32 = 2.0;
 #[inline]
 fn gc(rgb: [u8; 3]) -> GlyphColor {
     GlyphColor::rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Drag-selected text range inside a single block.
+#[derive(Clone, Debug)]
+pub enum TextSelection {
+    /// Cell-grid selection over a completed ShellCommand block's output.
+    Shell {
+        block_idx: usize,
+        /// (row, col) at mouse-down.
+        anchor: (usize, usize),
+        /// (row, col) at mouse-up / last drag point.
+        cursor: (usize, usize),
+    },
+    /// Glyph-buffer selection inside an AgentMessage block.
+    Buffer {
+        block_idx: usize,
+        anchor: TextCursor,
+        cursor: TextCursor,
+    },
+}
+
+#[inline]
+fn clamp_char_boundary(s: &str, mut i: usize) -> usize {
+    if i > s.len() {
+        return s.len();
+    }
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+#[inline]
+fn order_rc(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+#[inline]
+fn order_cur(a: TextCursor, b: TextCursor) -> (TextCursor, TextCursor) {
+    if (a.line, a.index) <= (b.line, b.index) {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 pub struct Renderer {
@@ -162,6 +206,11 @@ pub struct Renderer {
     pub search_match_blocks: Vec<usize>,
     /// Index (within `search_match_blocks`) of the currently focused match — painted more opaque.
     pub search_current_match: Option<usize>,
+
+    /// Drag-based text selection (cell range for shell output, cursor range for agent text).
+    pub text_selection: Option<TextSelection>,
+    /// True while the user is mid-drag (mouse down + dragging).
+    pub selecting: bool,
 }
 
 /// Accumulates GlyphBuffer entries for a frame. Parallel `keys` vec records
@@ -390,6 +439,8 @@ impl Renderer {
             tab_rects: vec![],
             search_match_blocks: vec![],
             search_current_match: None,
+            text_selection: None,
+            selecting: false,
         })
     }
 
@@ -520,6 +571,278 @@ impl Renderer {
     /// Plain block index hit-test (ignores sub-regions).
     pub fn block_index_at(&self, screen_y: f32) -> Option<usize> {
         self.block_hit_at(screen_y).map(|(i, _)| i)
+    }
+
+    // ── Text selection (drag-to-select) ─────────────────────────────────────
+
+    /// Compute the on-screen top-left of a block's shell-output cell grid (completed blocks only).
+    /// Returns (content_x, base_y, cell_w, cell_h).
+    fn shell_output_geom(&self, block_idx: usize) -> Option<(f32, f32, f32, f32)> {
+        let sc = self.scale_factor;
+        let padding = PADDING * sc;
+        let phys_font = self.font_size * sc;
+        let inner_gap = phys_font * 0.4;
+        let cmd_bar_h = phys_font * 2.8;
+        let (cell_w, cell_h) = self.terminal_cell_size();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let output_pad_x = 4.0 * sc;
+        let content_x = padding + output_pad_x;
+        let y = self.block_top_y(block_idx)?;
+        let sy = self.viewport.content_to_screen_y(y);
+        let base_y = sy + cmd_bar_h + inner_gap + 2.0 * sc;
+        Some((content_x, base_y, cell_w, cell_h))
+    }
+
+    /// Compute the on-screen top-left of an AgentMessage block's text buffer.
+    /// Returns (content_x, text_y, buf_w).
+    fn agent_buffer_geom(&self, block_idx: usize) -> Option<(f32, f32, f32)> {
+        let sc = self.scale_factor;
+        let padding = PADDING * sc;
+        let content_w = self.viewport.width - padding * 2.0;
+        let content_pad = 8.0 * sc;
+        let x_content = padding + content_pad;
+        let buf_w = (content_w - content_pad * 2.0).max(1.0);
+        let y = self.block_top_y(block_idx)?;
+        let sy = self.viewport.content_to_screen_y(y);
+        let text_y = sy + 4.0 * sc;
+        Some((x_content, text_y, buf_w))
+    }
+
+    fn shell_cell_at(
+        &self,
+        block_idx: usize,
+        phys_x: f32,
+        phys_y: f32,
+    ) -> Option<(usize, usize)> {
+        let block = self.blocks.get(block_idx)?;
+        let BlockContent::ShellCommand { output, .. } = &block.content else {
+            return None;
+        };
+        let (content_x, base_y, cell_w, cell_h) = self.shell_output_geom(block_idx)?;
+        let local_y = (phys_y - base_y).max(0.0);
+        let row_count = output.rows.len();
+        if row_count == 0 {
+            return None;
+        }
+        let row = ((local_y / cell_h).floor() as usize).min(row_count - 1);
+        let row_cells = output.rows[row].cells.len();
+        let local_x = (phys_x - content_x).max(0.0);
+        let col = ((local_x / cell_w).floor() as usize).min(row_cells);
+        Some((row, col))
+    }
+
+    fn agent_cursor_at(
+        &mut self,
+        block_idx: usize,
+        phys_x: f32,
+        phys_y: f32,
+    ) -> Option<TextCursor> {
+        let block = self.blocks.get(block_idx)?.clone();
+        if !matches!(block.content, BlockContent::AgentMessage { .. }) {
+            return None;
+        }
+        let content_text = block_content_text(&block);
+        if content_text.is_empty() {
+            return None;
+        }
+        let sc = self.scale_factor;
+        let phys_font = self.font_size * sc;
+        let line_h = phys_font * 1.4;
+        let (x_content, text_y, buf_w) = self.agent_buffer_geom(block_idx)?;
+        let content_len = content_text.len() as u64;
+        let bw_bits = buf_w.to_bits();
+        let pf_bits = phys_font.to_bits();
+        let vh_bits = self.viewport.height.to_bits();
+        // Use cache if key matches; otherwise shape fresh and cache it.
+        let cached_matches = self
+            .glyph_buf_cache
+            .get(&block.id)
+            .map(|(l, b, p, v, _)| *l == content_len && *b == bw_bits && *p == pf_bits && *v == vh_bits)
+            .unwrap_or(false);
+        if !cached_matches {
+            let (buf, _skipped) = self.make_markdown_buffer(&content_text, buf_w, phys_font);
+            self.glyph_buf_cache
+                .insert(block.id.clone(), (content_len, bw_bits, pf_bits, vh_bits, buf));
+        }
+        let (_, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
+        let max_vis = ((self.viewport.height / line_h).ceil() as usize + 30).max(50);
+        let skipped = content_text.lines().count().saturating_sub(max_vis);
+        let adjusted_text_y = text_y + skipped as f32 * line_h;
+        let local_x = (phys_x - x_content).max(0.0);
+        let local_y = (phys_y - adjusted_text_y).max(0.0);
+        buf.hit(local_x, local_y)
+    }
+
+    /// Mouse-down: start a selection at (phys_x, phys_y). Returns true if a selection began.
+    pub fn begin_text_selection(&mut self, phys_x: f32, phys_y: f32) -> bool {
+        self.text_selection = None;
+        self.selecting = false;
+        let Some((idx, _)) = self.block_hit_at(phys_y) else {
+            return false;
+        };
+        let Some(block) = self.blocks.get(idx) else {
+            return false;
+        };
+        match &block.content {
+            BlockContent::ShellCommand { .. } => {
+                // Only start text-selection inside the output area (below the cmd bar).
+                let Some((_, base_y, _, _)) = self.shell_output_geom(idx) else {
+                    return false;
+                };
+                if phys_y < base_y {
+                    return false;
+                }
+                if let Some((row, col)) = self.shell_cell_at(idx, phys_x, phys_y) {
+                    self.text_selection = Some(TextSelection::Shell {
+                        block_idx: idx,
+                        anchor: (row, col),
+                        cursor: (row, col),
+                    });
+                    self.selecting = true;
+                    return true;
+                }
+            }
+            BlockContent::AgentMessage { .. } => {
+                if let Some(cur) = self.agent_cursor_at(idx, phys_x, phys_y) {
+                    self.text_selection = Some(TextSelection::Buffer {
+                        block_idx: idx,
+                        anchor: cur,
+                        cursor: cur,
+                    });
+                    self.selecting = true;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Mouse-drag: extend the active selection to (phys_x, phys_y). No-op if not selecting.
+    pub fn update_text_selection(&mut self, phys_x: f32, phys_y: f32) {
+        if !self.selecting {
+            return;
+        }
+        let Some(sel) = self.text_selection.clone() else {
+            return;
+        };
+        match sel {
+            TextSelection::Shell { block_idx, anchor, .. } => {
+                if let Some(rc) = self.shell_cell_at(block_idx, phys_x, phys_y) {
+                    self.text_selection = Some(TextSelection::Shell {
+                        block_idx,
+                        anchor,
+                        cursor: rc,
+                    });
+                }
+            }
+            TextSelection::Buffer { block_idx, anchor, .. } => {
+                if let Some(cur) = self.agent_cursor_at(block_idx, phys_x, phys_y) {
+                    self.text_selection = Some(TextSelection::Buffer {
+                        block_idx,
+                        anchor,
+                        cursor: cur,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Mouse-up: stop tracking drag motion but keep the selection until next click/clear.
+    pub fn end_text_selection(&mut self) {
+        self.selecting = false;
+    }
+
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+        self.selecting = false;
+    }
+
+    /// True when there's a non-empty selection (anchor != cursor).
+    pub fn has_text_selection(&self) -> bool {
+        match &self.text_selection {
+            Some(TextSelection::Shell { anchor, cursor, .. }) => anchor != cursor,
+            Some(TextSelection::Buffer { anchor, cursor, .. }) => {
+                (anchor.line, anchor.index) != (cursor.line, cursor.index)
+            }
+            None => false,
+        }
+    }
+
+    /// Extract the selected text as a string. Returns None if no non-empty selection.
+    pub fn selected_text(&self) -> Option<String> {
+        match &self.text_selection {
+            Some(TextSelection::Shell {
+                block_idx,
+                anchor,
+                cursor,
+            }) => {
+                let block = self.blocks.get(*block_idx)?;
+                let BlockContent::ShellCommand { output, .. } = &block.content else {
+                    return None;
+                };
+                let (s, e) = order_rc(*anchor, *cursor);
+                if s == e {
+                    return None;
+                }
+                let mut out = String::new();
+                let row_max = output.rows.len().saturating_sub(1);
+                let s_row = s.0.min(row_max);
+                let e_row = e.0.min(row_max);
+                for row_idx in s_row..=e_row {
+                    let row = &output.rows[row_idx];
+                    let start_col = if row_idx == s_row { s.1 } else { 0 };
+                    let end_col = if row_idx == e_row {
+                        e.1.min(row.cells.len())
+                    } else {
+                        row.cells.len()
+                    };
+                    if end_col > start_col {
+                        for cell in &row.cells[start_col..end_col] {
+                            out.push_str(cell.grapheme.as_str());
+                        }
+                    }
+                    if row_idx != e_row {
+                        out.push('\n');
+                    }
+                }
+                let trimmed = out.trim_end_matches([' ', '\t']).to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            }
+            Some(TextSelection::Buffer {
+                block_idx,
+                anchor,
+                cursor,
+            }) => {
+                let block = self.blocks.get(*block_idx)?;
+                let (s, e) = order_cur(*anchor, *cursor);
+                if (s.line, s.index) == (e.line, e.index) {
+                    return None;
+                }
+                let (_, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
+                let mut out = String::new();
+                let last = buf.lines.len().saturating_sub(1);
+                let s_line = s.line.min(last);
+                let e_line = e.line.min(last);
+                for line_i in s_line..=e_line {
+                    let text = buf.lines[line_i].text();
+                    let mut start = if line_i == s_line { s.index } else { 0 };
+                    let mut end = if line_i == e_line { e.index } else { text.len() };
+                    start = clamp_char_boundary(text, start.min(text.len()));
+                    end = clamp_char_boundary(text, end.min(text.len()));
+                    if end > start {
+                        out.push_str(&text[start..end]);
+                    }
+                    if line_i != e_line {
+                        out.push('\n');
+                    }
+                }
+                if out.is_empty() { None } else { Some(out) }
+            }
+            None => None,
+        }
     }
 
     /// Returns true if the mode switcher pill at the bottom-left was clicked.
@@ -1183,6 +1506,93 @@ impl Renderer {
                                 }
                             }
                         }
+                    }
+                }
+                // Text-selection highlight rects (drag-selected substring within this block).
+                if let Some(sel) = &self.text_selection {
+                    match sel {
+                        TextSelection::Shell {
+                            block_idx,
+                            anchor,
+                            cursor,
+                        } if *block_idx == i => {
+                            if let (
+                                Some((c_x, base_y, cell_w, cell_h)),
+                                BlockContent::ShellCommand { output, .. },
+                            ) = (self.shell_output_geom(i), &block.content)
+                            {
+                                let (s, e) = order_rc(*anchor, *cursor);
+                                let tint = [0.40, 0.65, 1.0, 0.35];
+                                let row_max = output.rows.len().saturating_sub(1);
+                                let s_row = s.0.min(row_max);
+                                let e_row = e.0.min(row_max);
+                                for row_idx in s_row..=e_row {
+                                    let row = &output.rows[row_idx];
+                                    let start_col = if row_idx == s_row { s.1 } else { 0 };
+                                    let end_col = if row_idx == e_row {
+                                        e.1.min(row.cells.len())
+                                    } else {
+                                        row.cells.len()
+                                    };
+                                    if end_col <= start_col {
+                                        continue;
+                                    }
+                                    let rx = (c_x + start_col as f32 * cell_w).floor();
+                                    let ry = (base_y + row_idx as f32 * cell_h).floor();
+                                    let rw = ((end_col - start_col) as f32 * cell_w).ceil();
+                                    rects.push(RectInstance::filled(
+                                        rx,
+                                        ry,
+                                        rw,
+                                        cell_h.ceil(),
+                                        tint,
+                                    ));
+                                }
+                            }
+                        }
+                        TextSelection::Buffer {
+                            block_idx,
+                            anchor,
+                            cursor,
+                        } if *block_idx == i => {
+                            if let Some((x_content, text_y, _buf_w)) = self.agent_buffer_geom(i) {
+                                if let Some((_, _, _, _, buf)) = self.glyph_buf_cache.get(&block.id)
+                                {
+                                    let (s, e) = order_cur(*anchor, *cursor);
+                                    let tint = [0.40, 0.65, 1.0, 0.35];
+                                    let phys_font_local = self.font_size * sc;
+                                    let line_h = phys_font_local * 1.4;
+                                    let total_lines = match &block.content {
+                                        BlockContent::AgentMessage { .. } => {
+                                            block_content_text(block).lines().count()
+                                        }
+                                        _ => 0,
+                                    };
+                                    let max_vis = ((self.viewport.height / line_h).ceil() as usize
+                                        + 30)
+                                        .max(50);
+                                    let skipped = total_lines.saturating_sub(max_vis);
+                                    let adjusted_text_y = text_y + skipped as f32 * line_h;
+                                    for run in buf.layout_runs() {
+                                        if let Some((x_off, w_off)) = run.highlight(s, e) {
+                                            if w_off <= 0.0 {
+                                                continue;
+                                            }
+                                            let rx = x_content + x_off;
+                                            let ry = adjusted_text_y + run.line_top;
+                                            rects.push(RectInstance::filled(
+                                                rx,
+                                                ry,
+                                                w_off,
+                                                run.line_height,
+                                                tint,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // Selection highlight — for ShellCommand only the clicked sub-rect lights up.

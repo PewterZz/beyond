@@ -9,6 +9,7 @@ members = [
     "crates/beyonder-gpu",
     "crates/beyonder-ui",
     "crates/beyonder-config",
+    "crates/beyonder-remote",
 ]
 resolver = "2"
 
@@ -80,6 +81,7 @@ beyonder-runtime = { path = "crates/beyonder-runtime" }
 beyonder-gpu = { path = "crates/beyonder-gpu" }
 beyonder-ui = { path = "crates/beyonder-ui" }
 beyonder-config = { path = "crates/beyonder-config" }
+beyonder-remote = { path = "crates/beyonder-remote" }
 
 [dependencies]
 beyonder-ui = { workspace = true }

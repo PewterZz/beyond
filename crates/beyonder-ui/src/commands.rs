@@ -78,6 +78,11 @@ pub static COMMANDS: &[SlashCommand] = &[
         description: "Manage sessions",
     },
     SlashCommand {
+        name: "phone",
+        usage: "/phone on|off|pair|status|tailscale|ngrok",
+        description: "Bridge this terminal to the companion iOS app over LAN",
+    },
+    SlashCommand {
         name: "theme",
         usage: "/theme <name>",
         description: "Switch color theme (catppuccin-mocha | …)",

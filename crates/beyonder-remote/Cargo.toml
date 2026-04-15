@@ -1,0 +1,22 @@
+[package]
+name = "beyonder-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beyonder-core = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = { workspace = true }
+serde = { workspace = true }
+ciborium = "0.2"
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+mdns-sd = "0.11"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.8"
+base64 = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }

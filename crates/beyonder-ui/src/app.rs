@@ -394,6 +394,8 @@ pub struct App {
     mouse_button_down: Option<winit::event::MouseButton>,
     /// Last cell (1-based col, row) forwarded to the PTY, for motion de-duping.
     last_mouse_cell: Option<(u32, u32)>,
+    /// Timestamp + position of the last left-button press — used to detect double-clicks.
+    last_lmb_press: Option<(std::time::Instant, (f32, f32))>,
 
     // Context pill state
     pub conda_envs: Vec<String>,
@@ -458,6 +460,13 @@ pub struct App {
     pub search_current: Option<usize>,
     /// Saved input text to restore on search-mode exit.
     pub search_saved_input: String,
+
+    // ── /phone bridge ─────────────────────────────────────────────────────────
+    /// Live WebSocket bridge to the companion iOS app. `None` until /phone on.
+    pub remote: Option<beyonder_remote::RemoteHub>,
+    /// How many blocks have been marked final on the phone. Running blocks
+    /// beyond this get rebroadcast each tick so streaming text stays current.
+    remote_cursor: usize,
 }
 
 impl App {
@@ -584,6 +593,7 @@ impl App {
             scroll_accum: 0.0,
             mouse_button_down: None,
             last_mouse_cell: None,
+            last_lmb_press: None,
             current_conda: current_conda_env(),
             current_node: current_node_version(),
             conda_envs: fetch_conda_envs(),
@@ -612,6 +622,8 @@ impl App {
             search_matches: vec![],
             search_current: None,
             search_saved_input: String::new(),
+            remote: None,
+            remote_cursor: 0,
         })
     }
 
@@ -846,6 +858,13 @@ impl App {
                         *h = hovered;
                     }
                 }
+                // Extend an in-progress text selection while the left button is held.
+                if self.mouse_button_down == Some(winit::event::MouseButton::Left)
+                    && !self.renderer.tui_active
+                {
+                    self.renderer
+                        .update_text_selection(self.cursor_pos.0, self.cursor_pos.1);
+                }
                 // SGR mouse motion / drag forwarding while a TUI is active.
                 if self.renderer.tui_active {
                     let mr = self.term_grid.mouse_report_mode();
@@ -897,9 +916,39 @@ impl App {
                 }
                 if *state == ElementState::Released {
                     self.mouse_button_down = None;
+                    if *button == winit::event::MouseButton::Left {
+                        // Finish drag-selection; drop zero-width selections so the
+                        // next click starts clean (and block-click still works).
+                        self.renderer.end_text_selection();
+                        if !self.renderer.has_text_selection() {
+                            self.renderer.clear_text_selection();
+                        }
+                    }
                 }
                 if *state == ElementState::Pressed && *button == winit::event::MouseButton::Left {
-                    self.handle_click(self.cursor_pos);
+                    // Double-click detection: second LMB press within 400ms and 5px of the
+                    // first begins a text-selection drag instead of a block click.
+                    let now = std::time::Instant::now();
+                    let is_double = self.last_lmb_press.map_or(false, |(t, p)| {
+                        now.duration_since(t).as_millis() <= 400
+                            && (self.cursor_pos.0 - p.0).abs() <= 5.0
+                            && (self.cursor_pos.1 - p.1).abs() <= 5.0
+                    });
+                    if is_double {
+                        if self.renderer.begin_text_selection(self.cursor_pos.0, self.cursor_pos.1)
+                        {
+                            // Suppress block-level selection while a text range is active.
+                            self.selected_block = None;
+                            self.selected_sub_output = false;
+                            self.renderer.selected_block = None;
+                            self.renderer.selected_sub_output = false;
+                        }
+                        // Reset so triple-click doesn't chain into another "double".
+                        self.last_lmb_press = None;
+                    } else {
+                        self.last_lmb_press = Some((now, self.cursor_pos));
+                        self.handle_click(self.cursor_pos);
+                    }
                 }
                 false
             }
@@ -1216,11 +1265,13 @@ impl App {
             self.selected_sub_output = is_output;
             self.renderer.selected_block = Some(idx);
             self.renderer.selected_sub_output = is_output;
+            self.renderer.clear_text_selection();
         } else {
             self.selected_block = None;
             self.selected_sub_output = false;
             self.renderer.selected_block = None;
             self.renderer.selected_sub_output = false;
+            self.renderer.clear_text_selection();
         }
     }
 
@@ -1640,6 +1691,16 @@ impl App {
     }
 
     fn copy_selection(&self) {
+        // Drag-selected text (shell output cells or agent message buffer) takes priority
+        // over block-level selection. Falls back to whole-block copy when no range is set.
+        if let Some(text) = self.renderer.selected_text() {
+            if !text.is_empty() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(text);
+                }
+                return;
+            }
+        }
         let Some(idx) = self.selected_block else {
             return;
         };
@@ -2290,6 +2351,98 @@ impl App {
                 }
                 self.push_text_block(lines.join("\n"));
             }
+            ["/phone"] | ["/phone", "status"] => {
+                let line = match &self.remote {
+                    None => "phone bridge: off".to_string(),
+                    Some(hub) => format!(
+                        "phone bridge: on\nlisten :{}\nconnected: {}\npair: {}",
+                        hub.port,
+                        hub.is_connected(),
+                        hub.pairing_url
+                    ),
+                };
+                self.push_text_block(line);
+            }
+            ["/phone", "on"] => {
+                if self.remote.is_some() {
+                    self.push_text_block("phone bridge already running".into());
+                } else {
+                    match beyonder_remote::RemoteHub::start(
+                        format!("{:?}", self.session.id),
+                        self.active_model.clone(),
+                        self.active_provider.clone(),
+                    )
+                    .await
+                    {
+                        Ok(hub) => {
+                            let msg = format!(
+                                "phone bridge started on :{}\nScan to pair:\n\n{}\nOr enter URL manually: {}",
+                                hub.port, hub.qr_ascii, hub.pairing_url
+                            );
+                            self.remote = Some(hub);
+                            self.remote_cursor = 0;
+                            self.push_text_block(msg);
+                        }
+                        Err(e) => {
+                            error!("phone bridge: {e}");
+                            self.push_text_block(format!("phone bridge failed: {e}"));
+                        }
+                    }
+                }
+            }
+            ["/phone", "off"] => {
+                if self.remote.take().is_some() {
+                    self.push_text_block("phone bridge stopped".into());
+                } else {
+                    self.push_text_block("phone bridge was not running".into());
+                }
+            }
+            ["/phone", "pair"] => {
+                if let Some(hub) = &self.remote {
+                    let msg = format!(
+                        "Scan to pair ({}):\n\n{}\nOr enter URL manually: {}",
+                        hub.endpoint_label, hub.qr_ascii, hub.pairing_url
+                    );
+                    self.push_text_block(msg);
+                } else {
+                    self.push_text_block("phone bridge off — run /phone on first".into());
+                }
+            }
+            ["/phone", "tailscale"] => {
+                if let Some(hub) = self.remote.as_mut() {
+                    match hub.use_tailscale() {
+                        Some(host) => {
+                            let msg = format!(
+                                "phone bridge now advertised via Tailscale: {}\n\n{}\n{}",
+                                host, hub.qr_ascii, hub.pairing_url
+                            );
+                            self.push_text_block(msg);
+                        }
+                        None => self.push_text_block(
+                            "tailscale not installed or not logged in — `tailscale status` must work".into(),
+                        ),
+                    }
+                } else {
+                    self.push_text_block("phone bridge off — run /phone on first".into());
+                }
+            }
+            ["/phone", "ngrok"] => {
+                if let Some(hub) = self.remote.as_mut() {
+                    match hub.use_ngrok().await {
+                        Ok(host) => {
+                            let msg = format!(
+                                "phone bridge tunneled via ngrok: wss://{}\n\n{}\n{}",
+                                host, hub.qr_ascii, hub.pairing_url
+                            );
+                            self.push_text_block(msg);
+                        }
+                        Err(e) => self.push_text_block(format!("ngrok failed: {e}")),
+                    }
+                } else {
+                    self.push_text_block("phone bridge off — run /phone on first".into());
+                }
+            }
+
             ["/theme", name] => {
                 let theme = beyonder_config::theme_by_name(name);
                 self.config.theme = theme.name.to_string();
@@ -2578,6 +2731,56 @@ impl App {
             if !cmd.is_empty() {
                 let name = self.active_provider.clone();
                 self.prompt_agent(&name, cmd).await;
+            }
+        }
+
+        // /phone bridge: drain inbound commands, then push any new/changed blocks.
+        let mut remote_prompts: Vec<String> = vec![];
+        let mut remote_interrupt = false;
+        if let Some(hub) = &self.remote {
+            let mut inbox = vec![];
+            hub.poll_inbound(&mut inbox);
+            for msg in inbox {
+                match msg {
+                    beyonder_remote::ClientMsg::Prompt { text } => remote_prompts.push(text),
+                    beyonder_remote::ClientMsg::RunCommand { cmd } => {
+                        // Route shell commands through the same path as typed input.
+                        remote_prompts.push(cmd);
+                    }
+                    beyonder_remote::ClientMsg::Interrupt => remote_interrupt = true,
+                    beyonder_remote::ClientMsg::ToolHint { .. }
+                    | beyonder_remote::ClientMsg::Auth { .. }
+                    | beyonder_remote::ClientMsg::Ping { .. } => {}
+                }
+            }
+            // Broadcast any blocks we haven't sent yet. Running blocks get
+            // re-broadcast each tick so streaming text stays current on phone.
+            let len = self.blocks.len();
+            for idx in self.remote_cursor..len {
+                let block = self.blocks[idx].clone();
+                let _ = hub.send(beyonder_remote::ServerMsg::BlockAppended(block));
+            }
+            // Advance cursor past any completed blocks at the tail.
+            while self.remote_cursor < len {
+                let b = &self.blocks[self.remote_cursor];
+                if matches!(b.status, BlockStatus::Running) {
+                    // Re-broadcast the still-running block so the phone sees
+                    // the latest content on the next tick.
+                    let _ = hub.send(beyonder_remote::ServerMsg::BlockAppended(b.clone()));
+                    break;
+                }
+                self.remote_cursor += 1;
+            }
+        }
+        if remote_interrupt {
+            self.supervisor.reset_all_conversations();
+        }
+        for text in remote_prompts {
+            if text.starts_with('/') {
+                self.handle_command(&text).await;
+            } else {
+                let name = self.active_provider.clone();
+                self.prompt_agent(&name, text).await;
             }
         }
     }

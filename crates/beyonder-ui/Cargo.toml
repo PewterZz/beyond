@@ -11,6 +11,7 @@ beyonder-runtime = { workspace = true }
 beyonder-terminal = { workspace = true }
 beyonder-store = { workspace = true }
 beyonder-config = { workspace = true }
+beyonder-remote = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 tokio = { workspace = true }
