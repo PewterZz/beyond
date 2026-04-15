@@ -214,6 +214,26 @@ impl AppMode {
     }
 }
 
+/// Per-tab state — everything that needs to be isolated between tabs.
+/// When a tab is not active, its fields are stashed here; the active tab's
+/// fields live directly on `App` to keep existing code paths unchanged.
+pub struct TabState {
+    pub session: Session,
+    pub pty: Option<PtySession>,
+    pub block_builder: BlockBuilder,
+    pub term_grid: TermGrid,
+    pub blocks: Vec<Block>,
+    pub input: InputEditor,
+    pub agent_context_watermark: usize,
+    pub agent_running_tool: std::collections::HashMap<beyonder_core::AgentId, String>,
+    pub pending_agent_fallback: Option<String>,
+    pub selected_block: Option<usize>,
+    pub selected_sub_output: bool,
+    pub prev_tui_active: bool,
+    pub command_running: bool,
+    pub title: String,
+}
+
 pub struct App {
     pub renderer: Renderer,
     pub input: InputEditor,
@@ -269,6 +289,14 @@ pub struct App {
     /// Throttle for blocking env-probe subprocesses (node --version, conda env list).
     /// Only re-run them if this much time has elapsed since the last probe.
     last_env_probe: std::time::Instant,
+
+    // ── Tabs ──────────────────────────────────────────────────────────────────
+    /// Stashed per-tab state. `None` at `active_tab` (its fields live on App).
+    pub tabs: Vec<Option<TabState>>,
+    /// Index of the currently active tab in `tabs`.
+    pub active_tab: usize,
+    /// Displayable titles for each tab (synced to renderer before each frame).
+    pub tab_titles: Vec<String>,
 }
 
 impl App {
@@ -357,7 +385,189 @@ impl App {
             agent_running_tool: std::collections::HashMap::new(),
             // Use a past instant so the first post-command probe runs after startup.
             last_env_probe: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            tabs: vec![None],
+            active_tab: 0,
+            tab_titles: vec!["1".to_string()],
         })
+    }
+
+    /// Swap App's active per-tab fields with those in `target`.
+    /// Returns the displaced state as a new `TabState`.
+    fn exchange_active(&mut self, target: TabState) -> TabState {
+        TabState {
+            session: std::mem::replace(&mut self.session, target.session),
+            pty: std::mem::replace(&mut self.pty, target.pty),
+            block_builder: std::mem::replace(&mut self.block_builder, target.block_builder),
+            term_grid: std::mem::replace(&mut self.term_grid, target.term_grid),
+            blocks: std::mem::replace(&mut self.blocks, target.blocks),
+            input: std::mem::replace(&mut self.input, target.input),
+            agent_context_watermark: std::mem::replace(
+                &mut self.agent_context_watermark,
+                target.agent_context_watermark,
+            ),
+            agent_running_tool: std::mem::replace(
+                &mut self.agent_running_tool,
+                target.agent_running_tool,
+            ),
+            pending_agent_fallback: std::mem::replace(
+                &mut self.pending_agent_fallback,
+                target.pending_agent_fallback,
+            ),
+            selected_block: std::mem::replace(&mut self.selected_block, target.selected_block),
+            selected_sub_output: std::mem::replace(
+                &mut self.selected_sub_output,
+                target.selected_sub_output,
+            ),
+            prev_tui_active: std::mem::replace(&mut self.prev_tui_active, target.prev_tui_active),
+            command_running: std::mem::replace(&mut self.command_running, target.command_running),
+            title: target.title,
+        }
+    }
+
+    /// After swapping tabs, re-sync the renderer-visible fields so the next frame
+    /// reflects the newly-active tab's state, and reshape the PTY / grid so the
+    /// revived tab matches the current window size.
+    fn resync_renderer_after_tab_switch(&mut self) {
+        let (cols, rows) = if self.term_grid.tui_active() {
+            self.renderer.tui_grid_size()
+        } else {
+            self.renderer.terminal_grid_size()
+        };
+        self.term_grid.resize(cols as usize, rows as usize);
+        self.block_builder.set_grid_size(cols as usize, rows as usize);
+        if let Some(pty) = &self.pty {
+            let _ = pty.resize(rows, cols);
+        }
+        self.renderer.blocks = self.blocks.clone();
+        self.renderer.selected_block = self.selected_block;
+        self.renderer.selected_sub_output = self.selected_sub_output;
+        self.renderer.agent_running_tool = self.agent_running_tool.clone();
+        self.renderer.running_block_idx = None;
+        self.renderer.tui_cells = vec![];
+        self.renderer.viewport.scroll_to_bottom();
+        self.renderer.snap_input_scroll_to_cursor();
+    }
+
+    /// Construct a fresh `TabState` — spawns a new PTY sized to the renderer.
+    fn fresh_tab_state(&self, title: String) -> TabState {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let session = Session::new(cwd.clone());
+        let session_id = session.id.clone();
+        let _ = SessionStore::new(&self.store).insert(&session);
+
+        let (pty_cols, pty_rows) = self.renderer.terminal_grid_size();
+
+        let mut block_builder = BlockBuilder::new(session_id.clone(), cwd.clone());
+        block_builder.set_grid_size(pty_cols as usize, pty_rows as usize);
+        let term_grid = TermGrid::new(pty_cols as usize, pty_rows as usize);
+
+        let shell_env = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = self.config.shell.program.as_deref().unwrap_or(&shell_env);
+        let pty = match PtySession::spawn_sized(
+            session_id.clone(),
+            shell,
+            &cwd,
+            &[],
+            pty_cols,
+            pty_rows,
+        ) {
+            Ok(p) => {
+                info!("Shell PTY spawned for new tab");
+                Some(p)
+            }
+            Err(e) => {
+                warn!("Failed to spawn PTY for new tab: {e}");
+                None
+            }
+        };
+
+        TabState {
+            session,
+            pty,
+            block_builder,
+            term_grid,
+            blocks: vec![],
+            input: InputEditor::new(),
+            agent_context_watermark: 0,
+            agent_running_tool: std::collections::HashMap::new(),
+            pending_agent_fallback: None,
+            selected_block: None,
+            selected_sub_output: false,
+            prev_tui_active: false,
+            command_running: false,
+            title,
+        }
+    }
+
+    /// Open a new tab and switch to it.
+    pub fn new_tab(&mut self) {
+        let next_idx = self.tabs.len();
+        let title = format!("{}", next_idx + 1);
+        let fresh = self.fresh_tab_state(title.clone());
+        // Stash the currently-active tab, swap fresh into App, and append a None slot
+        // at the new active index.
+        let displaced = self.exchange_active(fresh);
+        self.tabs[self.active_tab] = Some(displaced);
+        self.tabs.push(None);
+        self.tab_titles.push(title);
+        self.active_tab = next_idx;
+        self.resync_renderer_after_tab_switch();
+    }
+
+    /// Close the active tab. Falls back to adjacent tab; if it was the last tab,
+    /// opens a fresh one so the app is never tab-less.
+    pub fn close_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            // Don't allow closing the last tab — silently ignore.
+            return;
+        }
+        // Pick the tab to switch to (prefer left neighbour, else right).
+        let target_idx = if self.active_tab > 0 {
+            self.active_tab - 1
+        } else {
+            1
+        };
+        let target = self.tabs[target_idx].take().unwrap();
+        // Swap target into App; the old active state is discarded (PTY child dropped).
+        let _old = self.exchange_active(target);
+        // Remove the slot we just left.
+        let removed = self.active_tab;
+        self.tabs.remove(removed);
+        self.tab_titles.remove(removed);
+        // Adjust active index: if target was to the right of the removed slot, it shifted left.
+        self.active_tab = if target_idx > removed {
+            target_idx - 1
+        } else {
+            target_idx
+        };
+        self.resync_renderer_after_tab_switch();
+    }
+
+    /// Switch to the tab at `idx` if valid and not already active.
+    pub fn switch_tab(&mut self, idx: usize) {
+        if idx == self.active_tab || idx >= self.tabs.len() {
+            return;
+        }
+        let target = match self.tabs[idx].take() {
+            Some(t) => t,
+            None => return, // shouldn't happen
+        };
+        let displaced = self.exchange_active(target);
+        self.tabs[self.active_tab] = Some(displaced);
+        self.active_tab = idx;
+        self.resync_renderer_after_tab_switch();
+    }
+
+    pub fn prev_tab(&mut self) {
+        if self.tabs.len() < 2 { return; }
+        let idx = if self.active_tab == 0 { self.tabs.len() - 1 } else { self.active_tab - 1 };
+        self.switch_tab(idx);
+    }
+
+    pub fn next_tab(&mut self) {
+        if self.tabs.len() < 2 { return; }
+        let idx = (self.active_tab + 1) % self.tabs.len();
+        self.switch_tab(idx);
     }
 
     /// Handle a winit window event.
@@ -552,6 +762,11 @@ impl App {
     }
 
     fn handle_click(&mut self, pos: (f32, f32)) {
+        // Tab strip click — switch to clicked tab.
+        if let Some(tab_idx) = self.renderer.tab_hit(pos.0, pos.1) {
+            self.switch_tab(tab_idx);
+            return;
+        }
         // Mode switcher click — cycle auto → cmd → agent → auto.
         if self.renderer.mode_pill_hit(pos.0, pos.1) {
             self.app_mode = match self.app_mode {
@@ -734,6 +949,25 @@ impl App {
                         }
                     }
                     return;
+                }
+            }
+        }
+
+        // Tab management shortcuts (macOS Cmd, other platforms Ctrl).
+        // Intercept BEFORE TUI forwarding so tabs work even inside nvim / claude.
+        let super_or_ctrl_tab = if cfg!(target_os = "macos") {
+            self.modifiers.super_key()
+        } else {
+            self.modifiers.control_key()
+        };
+        if super_or_ctrl_tab {
+            if let Key::Character(s) = &event.logical_key {
+                match s.as_str() {
+                    "t" => { self.new_tab(); return; }
+                    "w" => { self.close_tab(); return; }
+                    "[" => { self.prev_tab(); return; }
+                    "]" => { self.next_tab(); return; }
+                    _ => {}
                 }
             }
         }
@@ -1589,6 +1823,10 @@ impl App {
 
         // Sync mode switcher label.
         self.renderer.mode_label = self.app_mode.label().to_string();
+
+        // Sync tab strip state.
+        self.renderer.tab_labels = self.tab_titles.clone();
+        self.renderer.active_tab = self.active_tab;
 
         // Sync active model name.
         self.renderer.agent_model = self.active_model.clone();

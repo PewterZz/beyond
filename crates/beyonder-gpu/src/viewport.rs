@@ -7,6 +7,9 @@ pub struct Viewport {
     pub height: f32,
     pub scroll_offset: f32,
     pub total_content_height: f32,
+    /// Physical-pixel offset from the top of the window where the block stream begins.
+    /// Lets a tab strip (or other chrome) render above the blocks without overlap.
+    pub top_offset: f32,
     /// True when the user is at (or near) the bottom and auto-scroll should track new content.
     /// Set to false when the user explicitly scrolls up; restored when they return to the bottom.
     pub pinned_to_bottom: bool,
@@ -19,6 +22,7 @@ impl Viewport {
             height,
             scroll_offset: 0.0,
             total_content_height: 0.0,
+            top_offset: 0.0,
             pinned_to_bottom: true,
         }
     }
@@ -57,6 +61,6 @@ impl Viewport {
 
     /// Convert content-space y to screen-space y.
     pub fn content_to_screen_y(&self, content_y: f32) -> f32 {
-        content_y - self.scroll_offset
+        content_y - self.scroll_offset + self.top_offset
     }
 }

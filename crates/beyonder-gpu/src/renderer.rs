@@ -24,6 +24,8 @@ use crate::viewport::Viewport;
 const INPUT_BAR_HEIGHT: f32 = 120.0;
 /// Maximum number of visible lines in the input text area before it scrolls.
 const MAX_INPUT_LINES: usize = 4;
+/// Logical height of the tab strip when visible (>= 2 tabs).
+const TAB_BAR_HEIGHT: f32 = 28.0;
 /// Horizontal padding around the block stream.
 const PADDING: f32 = 4.0;
 /// Vertical gap between blocks.
@@ -129,6 +131,14 @@ pub struct Renderer {
     /// Blocks whose default-collapsed state has been overridden by the user.
     /// A block_id in this set is always shown expanded regardless of collapsed_default.
     pub user_expanded: HashSet<beyonder_core::BlockId>,
+
+    // Tab strip (synced from App before each render).
+    /// Labels for each tab. Strip is shown only when `tab_labels.len() >= 2`.
+    pub tab_labels: Vec<String>,
+    /// Index of the currently-active tab.
+    pub active_tab: usize,
+    /// Hit rects [x, y, w, h] per tab, written during tab-strip layout.
+    pub tab_rects: Vec<[f32; 4]>,
 }
 
 /// Accumulates GlyphBuffer entries for a frame. Parallel `keys` vec records
@@ -322,6 +332,9 @@ impl Renderer {
             glyph_buf_cache: HashMap::new(),
             agent_running_tool: HashMap::new(),
             user_expanded: HashSet::new(),
+            tab_labels: vec![],
+            active_tab: 0,
+            tab_rects: vec![],
         })
     }
 
@@ -332,12 +345,34 @@ impl Renderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
-        self.viewport.resize(width as f32, height as f32 - self.computed_bar_h);
+        let tab_h = self.tab_bar_height_phys();
+        self.viewport.resize(width as f32, height as f32 - self.computed_bar_h - tab_h);
+        self.viewport.top_offset = tab_h;
         self.rect_pipeline.update_screen_size(&self.queue, width as f32, height as f32);
         self.glyph_viewport.update(
             &self.queue,
             Resolution { width, height },
         );
+    }
+
+    /// Physical-pixel height of the tab strip. Zero when fewer than 2 tabs or when a TUI app is active.
+    pub fn tab_bar_height_phys(&self) -> f32 {
+        if self.tab_labels.len() >= 2 && !self.tui_active {
+            TAB_BAR_HEIGHT * self.scale_factor
+        } else {
+            0.0
+        }
+    }
+
+    /// Returns the tab index that was clicked at (px, py), if any.
+    pub fn tab_hit(&self, px: f32, py: f32) -> Option<usize> {
+        for (i, rect) in self.tab_rects.iter().enumerate() {
+            let [x, y, w, h] = *rect;
+            if px >= x && px < x + w && py >= y && py < y + h {
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
@@ -649,11 +684,14 @@ impl Renderer {
 
         // Recompute dynamic bar height and scroll offset.
         let old_bar_h = self.computed_bar_h;
+        let old_tab_h = self.viewport.top_offset;
         self.compute_bar_state();
-        if (self.computed_bar_h - old_bar_h).abs() > 0.5 {
+        let tab_h = self.tab_bar_height_phys();
+        if (self.computed_bar_h - old_bar_h).abs() > 0.5 || (tab_h - old_tab_h).abs() > 0.5 {
             let w = self.surface_config.width as f32;
             let h = self.surface_config.height as f32;
-            self.viewport.resize(w, h - self.computed_bar_h);
+            self.viewport.resize(w, h - self.computed_bar_h - tab_h);
+            self.viewport.top_offset = tab_h;
         }
 
         let output = match self.surface.get_current_texture() {
@@ -694,6 +732,7 @@ impl Renderer {
         if !bar_hidden {
             self.append_bar_rects(&mut rects);
         }
+        self.append_tab_bar_rects(&mut rects);
         self.rect_pipeline.upload_instances(&self.queue, &rects);
 
         // --- Text layout ---
@@ -713,6 +752,7 @@ impl Renderer {
             buf_list.keys.extend(bar_texts.keys);
             buf_list.clip_overrides.extend(bar_texts.clip_overrides);
         }
+        self.build_tab_bar_text_buffers(&mut buf_list);
         debug!(entries = buf_list.entries.len(), "render: text buffers built");
         let win_h = self.surface_config.height as f32;
         // When the bar is hidden, text fills the full window.
@@ -722,6 +762,8 @@ impl Renderer {
         } else {
             win_h - self.computed_bar_h
         };
+        // Block-stream text must not bleed above the tab strip.
+        let block_clip_top_min = self.tab_bar_height_phys() as i32;
         let text_areas: Vec<TextArea> = buf_list.entries
             .iter()
             .enumerate()
@@ -732,7 +774,7 @@ impl Renderer {
                 let (clip_top, clip_bottom) = if let Some((ct, cb)) = buf_list.clip_overrides[i] {
                     (ct, cb)
                 } else if i < block_entry_count {
-                    ((*y as i32).max(0), ((*y + *h) as i32).min(text_clip_bottom as i32))
+                    ((*y as i32).max(block_clip_top_min), ((*y + *h) as i32).min(text_clip_bottom as i32))
                 } else {
                     ((*y as i32).max(0), (*y + *h) as i32)
                 };
@@ -1644,6 +1686,78 @@ impl Renderer {
         }
 
         results
+    }
+
+    /// Draw tab-strip backgrounds + updates `self.tab_rects` for hit-testing.
+    /// No-ops when fewer than 2 tabs or TUI active (tab_bar_height_phys() == 0).
+    fn append_tab_bar_rects(&mut self, rects: &mut Vec<RectInstance>) {
+        let tab_h = self.tab_bar_height_phys();
+        if tab_h <= 0.0 || self.tab_labels.is_empty() {
+            self.tab_rects.clear();
+            return;
+        }
+        let sc = self.scale_factor;
+        let win_w = self.surface_config.width as f32;
+        // Strip background (Catppuccin Mantle).
+        rects.push(RectInstance::filled(0.0, 0.0, win_w, tab_h, [0.094, 0.094, 0.145, 1.0]));
+        // Bottom separator.
+        rects.push(RectInstance::filled(0.0, tab_h - sc.ceil(), win_w, sc.ceil(), [0.271, 0.278, 0.353, 0.6]));
+
+        let pad_x = 8.0 * sc;
+        let gap = 4.0 * sc;
+        let inner_pad = 12.0 * sc;
+        let phys_font = self.font_size * sc * 0.85;
+        let char_w = phys_font * 0.6;
+        let tab_inner_h = tab_h - 6.0 * sc;
+        let tab_y = 3.0 * sc;
+
+        let mut x = pad_x;
+        let labels = self.tab_labels.clone();
+        let active = self.active_tab;
+        let mut new_rects: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
+        for (i, label) in labels.iter().enumerate() {
+            let tab_w = label.chars().count() as f32 * char_w + inner_pad * 2.0;
+            let is_active = i == active;
+            let (bg, border) = if is_active {
+                ([0.192, 0.196, 0.267, 1.0_f32], [0.537, 0.706, 0.980, 0.9_f32])
+            } else {
+                ([0.125, 0.125, 0.180, 1.0_f32], [0.271, 0.278, 0.353, 0.5_f32])
+            };
+            rects.push(
+                RectInstance::filled(x, tab_y, tab_w, tab_inner_h, bg)
+                    .with_radius(4.0)
+                    .with_border(1.0, border),
+            );
+            new_rects.push([x, tab_y, tab_w, tab_inner_h]);
+            x += tab_w + gap;
+        }
+        self.tab_rects = new_rects;
+    }
+
+    /// Append tab-strip label text to the given TextBufList.
+    fn build_tab_bar_text_buffers(&mut self, results: &mut TextBufList) {
+        let tab_h = self.tab_bar_height_phys();
+        if tab_h <= 0.0 || self.tab_rects.is_empty() {
+            return;
+        }
+        let sc = self.scale_factor;
+        let phys_font = self.font_size * sc * 0.85;
+        let line_h = phys_font * 1.4;
+        let labels = self.tab_labels.clone();
+        let active = self.active_tab;
+        let rects = self.tab_rects.clone();
+        let inner_pad = 12.0 * sc;
+        for (i, label) in labels.iter().enumerate() {
+            let Some(&[rx, ry, rw, rh]) = rects.get(i) else { continue };
+            let color = if i == active {
+                GlyphColor::rgb(205, 214, 244)
+            } else {
+                GlyphColor::rgb(147, 153, 178)
+            };
+            let ty = ry + (rh - line_h) * 0.5;
+            let buf = self.make_pill_buffer(label, (rw - inner_pad * 2.0).max(1.0), phys_font, color);
+            results.push((buf, rx + inner_pad, ty, rw - inner_pad * 2.0, line_h, color));
+        }
     }
 
     fn make_pill_buffer(

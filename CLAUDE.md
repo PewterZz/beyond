@@ -80,15 +80,28 @@ Switch at runtime with `/provider ollama|llama_cpp|mlx` (saves to config). Switc
 
 ## Input Editor & Keyboard Shortcuts
 
-`InputEditor` (`beyonder-ui/src/input_editor.rs`) is a single-line UTF-8 editor with cursor and history. It supports:
+`InputEditor` (`beyonder-ui/src/input_editor.rs`) is a UTF-8 editor with cursor and history. Newlines (`\n`) are allowed in the buffer (inserted via `Shift+Enter`). It supports:
 
 - **Editing**: `Cmd+A` (select-all), `Cmd+X` (cut), `Cmd+C` (copy selected), `Cmd+V` (paste from clipboard or bracketed paste into PTY), `Ctrl+K` (kill to end), `Ctrl+U` (kill to start), `Ctrl+W` / `Alt+Backspace` (delete word backward).
 - **Navigation**: `←`/`→`, `Cmd+←`/`Cmd+→` (home/end), `Alt+←`/`Alt+→` (word left/right), `↑`/`↓` (history).
+- **Submit vs newline**: `Enter` submits; `Shift+Enter` inserts `\n` for a true multi-line prompt.
 - **Clipboard**: `arboard` for the system clipboard. OSC 52 passthrough (`\x1b]52;...`) lets TUI apps (nvim, etc.) read/write the clipboard; responses are written back to the PTY in `App::tick()`.
 - **Bracketed paste**: `\x1b[200~{text}\x1b[201~` is sent to the active PTY when paste is triggered in TUI mode.
 - The `all_selected` flag on `InputEditor` signals "select-all active"; the renderer renders the input in Catppuccin Blue with a block cursor. Any subsequent insert/delete replaces the entire contents.
 
-The input bar height is dynamic (see beyonder-gpu above). It grows by one `font_size * 1.4` line per wrapped visual line, up to `MAX_INPUT_LINES = 4`, then scrolls. The viewport above the bar adjusts automatically.
+The input bar height is dynamic (see beyonder-gpu above). It grows by one `font_size * 1.4` line per visual line (wrap **or** explicit `\n`), up to `MAX_INPUT_LINES = 4`, then scrolls. The viewport above the bar adjusts automatically.
+
+**Input scroll model** — `input_scroll_px` is an independent viewport offset within the input text area:
+- Mouse wheel over the input bar calls `Renderer::scroll_input(delta)` — scrolls the input text freely (lets you see the top of a long pasted message).
+- Mouse wheel over the block stream calls `Renderer::scroll(delta)` — scrolls blocks (see below).
+- Any keystroke that edits or moves the cursor calls `Renderer::snap_input_scroll_to_cursor()` to bring the cursor back into view. This is called from every early-return branch in `App::handle_key_event` that mutates input (paste, cut, kill, word/home/end nav, etc.) — keep this invariant when adding new shortcuts.
+- `compute_bar_state()` only clamps `input_scroll_px` to `[0, max_scroll]`; it does **not** cursor-follow. Cursor-follow is exclusively `snap_input_scroll_to_cursor`'s job.
+
+**Block stream scroll model** — `Viewport::pinned_to_bottom` (`beyonder-gpu/src/viewport.rs`) drives auto-follow:
+- `scroll_to_bottom()` sets it `true`; `scroll_to_top()` sets it `false`; `scroll(delta)` sets it based on whether the resulting offset is within 1 px of `max_scroll`.
+- The per-frame auto-snap in `Renderer::render` (`if running_block_idx.is_some() && viewport.pinned_to_bottom { scroll_to_bottom() }`) only fires while pinned — so scrolling up during streaming sticks.
+- `App::add_block` and `App::push_text_block` only call `scroll_to_bottom()` when `pinned_to_bottom` is already true — new agent/shell/approval blocks don't yank the user back down mid-read.
+- Explicit user actions (submitting a prompt via `push_user_block` / `push_pending_agent_block`, and `/clear`) unconditionally re-pin to bottom.
 
 ## Conventions
 
