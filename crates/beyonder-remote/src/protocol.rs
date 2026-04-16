@@ -172,6 +172,45 @@ pub fn compute_frame_diff(
     Some(changes)
 }
 
+/// Adaptive frame rate controller: ramps to 10fps during activity,
+/// backs off to 1fps when idle. Avoids wasting bandwidth on static screens.
+#[derive(Debug, Clone)]
+pub struct AdaptiveThrottle {
+    pub interval_ms: u64,
+    pub idle_frames: u32,
+}
+
+impl Default for AdaptiveThrottle {
+    fn default() -> Self {
+        Self {
+            interval_ms: 100,
+            idle_frames: 0,
+        }
+    }
+}
+
+impl AdaptiveThrottle {
+    pub fn report_activity(&mut self, had_changes: bool) {
+        if had_changes {
+            self.idle_frames = 0;
+            self.interval_ms = 100; // 10fps
+        } else {
+            self.idle_frames = self.idle_frames.saturating_add(1);
+            self.interval_ms = match self.idle_frames {
+                0..=1 => 100,
+                2..=3 => 200,
+                4..=6 => 333,
+                7..=10 => 500,
+                _ => 1000,
+            };
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentPatch {
     pub text_append: Option<String>,
@@ -363,5 +402,60 @@ mod tests {
             "typical mostly-blank frame should compress >4x, got {:.1}x (ratio {ratio:.3})",
             1.0 / ratio
         );
+    }
+
+    #[test]
+    fn adaptive_throttle_ramps_up_on_activity() {
+        let mut t = AdaptiveThrottle::default();
+        assert_eq!(t.interval_ms, 100);
+        // Simulate activity.
+        t.report_activity(true);
+        assert_eq!(t.interval_ms, 100);
+        assert_eq!(t.idle_frames, 0);
+    }
+
+    #[test]
+    fn adaptive_throttle_backs_off_when_idle() {
+        let mut t = AdaptiveThrottle::default();
+        let mut intervals = vec![];
+        for _ in 0..15 {
+            t.report_activity(false);
+            intervals.push(t.interval_ms);
+        }
+        // Should monotonically increase and cap at 1000ms.
+        for w in intervals.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "interval should not decrease: {} < {}",
+                w[1],
+                w[0]
+            );
+        }
+        assert_eq!(*intervals.last().unwrap(), 1000);
+    }
+
+    #[test]
+    fn adaptive_throttle_resets_on_activity_after_idle() {
+        let mut t = AdaptiveThrottle::default();
+        // Go idle for a while.
+        for _ in 0..20 {
+            t.report_activity(false);
+        }
+        assert_eq!(t.interval_ms, 1000);
+        // Activity snaps back to 10fps.
+        t.report_activity(true);
+        assert_eq!(t.interval_ms, 100);
+        assert_eq!(t.idle_frames, 0);
+    }
+
+    #[test]
+    fn adaptive_throttle_reset_returns_to_default() {
+        let mut t = AdaptiveThrottle::default();
+        for _ in 0..20 {
+            t.report_activity(false);
+        }
+        t.reset();
+        assert_eq!(t.interval_ms, 100);
+        assert_eq!(t.idle_frames, 0);
     }
 }

@@ -472,6 +472,8 @@ pub struct App {
     /// resize events don't clobber what the phone asked for.
     remote_pty_dims: Option<(u16, u16)>,
     remote_last_pty_frame: std::time::Instant,
+    /// Adaptive frame rate controller for phone PTY mirror.
+    remote_throttle: beyonder_remote::protocol::AdaptiveThrottle,
     /// Previous PTY frame cells sent to phone — used to compute diffs.
     remote_prev_cells: Vec<Vec<beyonder_remote::PtyCell>>,
     /// Proxy to wake the winit event loop from async event sources (PTY, agent, broker).
@@ -654,6 +656,7 @@ impl App {
             remote_cursor: 0,
             remote_pty_dims: None,
             remote_last_pty_frame: std::time::Instant::now(),
+            remote_throttle: beyonder_remote::protocol::AdaptiveThrottle::default(),
             remote_prev_cells: vec![],
             remote_connect_gen: 0,
             event_loop_proxy,
@@ -2890,6 +2893,7 @@ impl App {
                 self.remote_cursor = 0;
                 self.remote_pty_dims = None;
                 self.remote_prev_cells.clear();
+                self.remote_throttle.reset();
                 eprintln!(
                     "[remote] phone reconnected (gen={gen}), resending all {} blocks",
                     self.blocks.len()
@@ -2921,8 +2925,9 @@ impl App {
                     | beyonder_remote::ClientMsg::Ping { .. } => {}
                 }
             }
-            // Live PTY mirror — throttled to ~3fps to keep payload manageable.
-            if self.remote_last_pty_frame.elapsed() >= std::time::Duration::from_millis(333) {
+            // Live PTY mirror — adaptive throttle: 10fps active, backs off to 1fps idle.
+            let interval = std::time::Duration::from_millis(self.remote_throttle.interval_ms);
+            if self.remote_last_pty_frame.elapsed() >= interval {
                 self.remote_last_pty_frame = std::time::Instant::now();
                 let cells: Vec<Vec<beyonder_remote::PtyCell>> = self
                     .term_grid
@@ -2945,10 +2950,12 @@ impl App {
                 let (cur_row, cur_col) = self.term_grid.cursor_pos();
 
                 // Diff against previous frame — send only changed cells.
+                let had_changes;
                 if let Some(changes) =
                     beyonder_remote::protocol::compute_frame_diff(&self.remote_prev_cells, &cells)
                 {
                     let total_cells: usize = cells.iter().map(|r| r.len()).sum();
+                    had_changes = !changes.is_empty();
                     if !changes.is_empty() && changes.len() < total_cells / 2 {
                         let _ = hub.send(beyonder_remote::ServerMsg::PtyFrameDiff(
                             beyonder_remote::PtyFrameDiff {
@@ -2972,6 +2979,7 @@ impl App {
                     }
                 } else {
                     // First frame or grid resized — send full.
+                    had_changes = true;
                     let _ = hub.send(beyonder_remote::ServerMsg::PtyFrame(
                         beyonder_remote::PtyFrame {
                             cols: self.term_grid.cols as u16,
@@ -2983,6 +2991,8 @@ impl App {
                     ));
                 }
                 self.remote_prev_cells = cells;
+
+                self.remote_throttle.report_activity(had_changes);
             }
 
             // Broadcast any blocks we haven't sent yet. Cap per-tick to avoid
