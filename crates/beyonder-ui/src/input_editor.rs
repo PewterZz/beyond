@@ -103,10 +103,10 @@ impl InputEditor {
         }
         // Skip trailing spaces, then skip the word.
         let mut i = self.cursor;
-        while i > 0 && self.text[..i].chars().next_back() == Some(' ') {
+        while i > 0 && self.text[..i].ends_with(' ') {
             i -= 1;
         }
-        while i > 0 && self.text[..i].chars().next_back() != Some(' ') {
+        while i > 0 && !self.text[..i].ends_with(' ') {
             i -= self.text[..i]
                 .chars()
                 .next_back()
@@ -124,14 +124,14 @@ impl InputEditor {
             return;
         }
         let mut i = self.cursor;
-        while i > 0 && self.text[..i].chars().next_back() == Some(' ') {
+        while i > 0 && self.text[..i].ends_with(' ') {
             i -= self.text[..i]
                 .chars()
                 .next_back()
                 .map(|c| c.len_utf8())
                 .unwrap_or(1);
         }
-        while i > 0 && self.text[..i].chars().next_back() != Some(' ') {
+        while i > 0 && !self.text[..i].ends_with(' ') {
             i -= self.text[..i]
                 .chars()
                 .next_back()
@@ -149,10 +149,10 @@ impl InputEditor {
             return;
         }
         let mut i = self.cursor;
-        while i < len && self.text[i..].chars().next() == Some(' ') {
+        while i < len && self.text[i..].starts_with(' ') {
             i += 1;
         }
-        while i < len && self.text[i..].chars().next() != Some(' ') {
+        while i < len && !self.text[i..].starts_with(' ') {
             i += self.text[i..]
                 .chars()
                 .next()

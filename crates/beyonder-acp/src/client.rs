@@ -176,35 +176,31 @@ impl AcpClient {
                         index,
                         content_block,
                     } => {
-                        match content_block {
-                            AcpContentBlock::ToolUse { id, name, input } => {
-                                if input != serde_json::Value::Null
-                                    && input != serde_json::Value::Object(Default::default())
-                                {
-                                    // Input already present, store as completed right away
-                                    // on ContentBlockStop we'll finalize it
-                                    let input_json =
-                                        serde_json::to_string(&input).unwrap_or_default();
-                                    self.pending_tools.insert(
-                                        index,
-                                        PartialTool {
-                                            id,
-                                            name,
-                                            input_json,
-                                        },
-                                    );
-                                } else {
-                                    self.pending_tools.insert(
-                                        index,
-                                        PartialTool {
-                                            id,
-                                            name,
-                                            input_json: String::new(),
-                                        },
-                                    );
-                                }
+                        if let AcpContentBlock::ToolUse { id, name, input } = content_block {
+                            if input != serde_json::Value::Null
+                                && input != serde_json::Value::Object(Default::default())
+                            {
+                                // Input already present, store as completed right away
+                                // on ContentBlockStop we'll finalize it
+                                let input_json = serde_json::to_string(&input).unwrap_or_default();
+                                self.pending_tools.insert(
+                                    index,
+                                    PartialTool {
+                                        id,
+                                        name,
+                                        input_json,
+                                    },
+                                );
+                            } else {
+                                self.pending_tools.insert(
+                                    index,
+                                    PartialTool {
+                                        id,
+                                        name,
+                                        input_json: String::new(),
+                                    },
+                                );
                             }
-                            _ => {}
                         }
                     }
                     AcpStreamEvent::ContentBlockStop { index } => {

@@ -7,6 +7,7 @@ use beyonder_core::{Block, BlockContent, BlockKind, BlockStatus};
 
 use crate::pipeline::RectInstance;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_shell_block(
     block: &Block,
     x: f32,

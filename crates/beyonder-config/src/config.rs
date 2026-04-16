@@ -149,8 +149,7 @@ impl BeyonderConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let toml_str = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let toml_str = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(&path, toml_str)
     }
 }
@@ -170,15 +169,9 @@ impl Default for FontConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ShellConfig {
     pub program: Option<String>,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self { program: None }
-    }
 }
 
 /// Base directory for all Beyonder state. Pinned to `$HOME/.config/beyond` on

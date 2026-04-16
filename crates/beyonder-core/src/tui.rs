@@ -3,20 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Underline rendering style for a cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnderlineStyle {
+    #[default]
     None,
     Single,
     Double,
     Curly,
     Dotted,
     Dashed,
-}
-
-impl Default for UnderlineStyle {
-    fn default() -> Self {
-        UnderlineStyle::None
-    }
 }
 
 /// A single rendered cell in a TUI screen grid.

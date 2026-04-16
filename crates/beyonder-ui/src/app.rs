@@ -1052,7 +1052,7 @@ impl App {
                     // Double-click detection: second LMB press within 400ms and 5px of the
                     // first begins a text-selection drag instead of a block click.
                     let now = std::time::Instant::now();
-                    let is_double = self.last_lmb_press.map_or(false, |(t, p)| {
+                    let is_double = self.last_lmb_press.is_some_and(|(t, p)| {
                         now.duration_since(t).as_millis() <= 400
                             && (self.cursor_pos.0 - p.0).abs() <= 5.0
                             && (self.cursor_pos.1 - p.1).abs() <= 5.0
@@ -2178,10 +2178,7 @@ impl App {
             .unwrap_or(0);
         let token = &text[token_start..cursor];
         let prior = &text[..token_start];
-        let is_command_pos = prior.trim().is_empty()
-            || prior
-                .trim_end()
-                .ends_with(|c: char| matches!(c, '|' | ';' | '&'));
+        let is_command_pos = prior.trim().is_empty() || prior.trim_end().ends_with(['|', ';', '&']);
 
         let cwd = self.block_builder.cwd.clone();
         let candidates: Vec<String> = if !token.starts_with('~')
@@ -2411,7 +2408,7 @@ impl App {
             }
             ["/font", size_str] => {
                 if let Ok(size) = size_str.parse::<f32>() {
-                    if size >= 8.0 && size <= 48.0 {
+                    if (8.0..=48.0).contains(&size) {
                         self.renderer.font_size = size;
                         info!("Font size set to {size}");
                     } else {
@@ -3449,7 +3446,7 @@ impl App {
             return true;
         }
         self.tabs.iter().any(|t| {
-            t.as_ref().map_or(false, |ts| {
+            t.as_ref().is_some_and(|ts| {
                 ts.blocks
                     .iter()
                     .any(|b| matches!(b.status, beyonder_core::BlockStatus::Running))
@@ -3520,7 +3517,7 @@ impl App {
         self.renderer.input_running = self.block_builder.is_running_command()
             && self
                 .command_started_at
-                .map_or(false, |t| t.elapsed().as_millis() >= 500);
+                .is_some_and(|t| t.elapsed().as_millis() >= 500);
 
         // Command palette — filter commands by what's been typed after the leading /.
         self.renderer.command_palette =

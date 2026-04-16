@@ -107,7 +107,7 @@ impl PtySession {
                 let zshrc = format!("{hooks}\n[ -f {home}/.zshrc ] && source {home}/.zshrc\n");
                 std::fs::write(session_dir.join(".zshrc"), zshrc).ok();
                 cmd.env("ZDOTDIR", &session_dir);
-                cmd.args(&["-i"]);
+                cmd.args(["-i"]);
             }
             crate::shell_hooks::ShellKind::Bash => {
                 // --rcfile overrides ~/.bashrc — source the real one first.
@@ -115,14 +115,14 @@ impl PtySession {
                 let user_rc = format!("[ -f {home}/.bashrc ] && source {home}/.bashrc\n");
                 let hooks = crate::shell_hooks::bash_init_script(&session_id.0);
                 std::fs::write(&rcfile, format!("{user_rc}\n{hooks}")).ok();
-                cmd.args(&["--rcfile", rcfile.to_str().unwrap_or(""), "-i"]);
+                cmd.args(["--rcfile", rcfile.to_str().unwrap_or(""), "-i"]);
             }
             crate::shell_hooks::ShellKind::Fish => {
                 // --init-command runs in addition to user config; no overlay needed.
                 let initf = session_dir.join("beyonder.fish");
                 std::fs::write(&initf, crate::shell_hooks::fish_init_script(&session_id.0)).ok();
                 let src_cmd = format!("source {}", initf.display());
-                cmd.args(&["--init-command", &src_cmd, "-i"]);
+                cmd.args(["--init-command", &src_cmd, "-i"]);
             }
             crate::shell_hooks::ShellKind::Nushell => {
                 // Override --config / --env-config with files that source the
@@ -149,7 +149,7 @@ impl PtySession {
                 };
                 let hooks = crate::shell_hooks::nushell_init_script(&session_id.0);
                 std::fs::write(&cfg_path, format!("{user_cfg_src}\n{hooks}")).ok();
-                cmd.args(&[
+                cmd.args([
                     "--config",
                     cfg_path.to_str().unwrap_or(""),
                     "--env-config",
@@ -157,7 +157,7 @@ impl PtySession {
                 ]);
             }
             crate::shell_hooks::ShellKind::Unknown => {
-                cmd.args(&["-i"]);
+                cmd.args(["-i"]);
             }
         }
 

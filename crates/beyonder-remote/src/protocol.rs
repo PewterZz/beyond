@@ -20,6 +20,7 @@ pub struct Hello {
 }
 
 /// Server → phone.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
 pub enum ServerMsg {
@@ -491,8 +492,8 @@ mod tests {
         let prev = grid(24, 80, " ");
         let mut curr = prev.clone();
         // Change 10 cells out of 1920 — diff should be much smaller.
-        for i in 0..10 {
-            curr[0][i] = cell("X", false);
+        for slot in curr[0].iter_mut().take(10) {
+            *slot = cell("X", false);
         }
         let diff = compute_frame_diff(&prev, &curr).unwrap();
         assert_eq!(diff.len(), 10);

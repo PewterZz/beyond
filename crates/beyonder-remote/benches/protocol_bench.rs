@@ -42,8 +42,8 @@ fn bench_frame_diff(c: &mut Criterion) {
     let prev = realistic_grid();
     let mut curr = prev.clone();
     // Change 10 cells to simulate a cursor move + small output.
-    for i in 0..10 {
-        curr[3][i] = cell("X", false);
+    for slot in curr[3].iter_mut().take(10) {
+        *slot = cell("X", false);
     }
 
     c.bench_function("frame_diff_10_changed", |b| {

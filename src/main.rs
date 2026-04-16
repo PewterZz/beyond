@@ -143,7 +143,7 @@ impl ApplicationHandler<()> for BeyonderHandler {
 
         // When a spinner is animating (running agent/command block) we need
         // continuous redraws even if tick() had no work this iteration.
-        let animating = self.app.as_ref().map_or(false, |app| app.needs_animation());
+        let animating = self.app.as_ref().is_some_and(|app| app.needs_animation());
         if animating {
             self.needs_redraw = true;
         }
@@ -167,7 +167,7 @@ impl ApplicationHandler<()> for BeyonderHandler {
             let has_work = self
                 .app
                 .as_ref()
-                .map_or(false, |app| app.has_pending_async_work());
+                .is_some_and(|app| app.has_pending_async_work());
             let timeout = if has_work { 16 } else { 500 };
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 std::time::Instant::now() + std::time::Duration::from_millis(timeout),

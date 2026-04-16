@@ -262,6 +262,7 @@ pub struct QrBitmap {
 struct TextBufList {
     entries: Vec<(GlyphBuffer, f32, f32, f32, f32, GlyphColor)>,
     /// (block_id, content_len, buf_w_bits, pf_bits, viewport_h_bits)
+    #[allow(clippy::type_complexity)]
     keys: Vec<Option<(beyonder_core::BlockId, u64, u32, u32, u32)>>,
     /// Per-entry explicit clip rect override (clip_top, clip_bottom). When Some,
     /// overrides the default derivation from (y, y+h). Used for scrolled buffers
@@ -877,8 +878,8 @@ impl Renderer {
         let side_modules = (qr.width + 8) as f32; // +8 for 4-module quiet zone each side
                                                   // Target ~250 logical px → 250*sc physical.
         let target = 250.0 * sc;
-        let ideal = (target / side_modules).floor().max(2.0);
-        ideal
+
+        (target / side_modules).floor().max(2.0)
     }
 
     /// Pixel height a QR overlay will occupy for a given content width.
@@ -1467,7 +1468,7 @@ impl Renderer {
         const EVICT_AGE: u64 = 120;
         const MAX_CACHE: usize = 256;
         let fc = self.frame_counter;
-        if self.glyph_buf_cache.len() > MAX_CACHE || fc % 60 == 0 {
+        if self.glyph_buf_cache.len() > MAX_CACHE || fc.is_multiple_of(60) {
             self.glyph_buf_cache
                 .retain(|_, (_, _, _, _, last, _)| fc.saturating_sub(*last) < EVICT_AGE);
         }
@@ -2353,7 +2354,7 @@ impl Renderer {
             // Per-run rendering: each color run is positioned at its exact column pixel
             // with a fixed width, so advance-width mismatches for special chars (box-drawing,
             // Nerd Font icons) are contained and don't shift subsequent text rightward.
-            let runs = self.make_tui_row_runs(&row, cell_w, phys_font);
+            let runs = self.make_tui_row_runs(row, cell_w, phys_font);
             for (buf, x, w, color) in runs {
                 results.push((buf, pad + x, y, w, cell_h, color));
             }
@@ -2378,6 +2379,7 @@ impl Renderer {
 
         // Take ownership to avoid cloning — returned at the end.
         let blocks = std::mem::take(&mut self.blocks);
+        #[allow(clippy::needless_range_loop)]
         for block_idx in first..blocks.len() {
             let block = &blocks[block_idx];
             let block_t0 = std::time::Instant::now();
@@ -2527,7 +2529,7 @@ impl Renderer {
                         if ry > sy + h {
                             break;
                         }
-                        let runs = self.make_tui_row_runs(&row, cell_w, phys_font);
+                        let runs = self.make_tui_row_runs(row, cell_w, phys_font);
                         for (buf, rx, w, color) in runs {
                             results.push((buf, x + output_pad_x + rx, ry, w, cell_h, color));
                         }
@@ -3438,6 +3440,7 @@ impl Renderer {
 /// Paint an underline beneath a single cell rect. `px` is the line thickness
 /// in physical pixels (== scale_factor, min 1). Dotted/dashed use alpha-dim
 /// approximations to avoid segmenting the rect into many tiny quads.
+#[allow(clippy::too_many_arguments)]
 fn draw_underline(
     rects: &mut Vec<RectInstance>,
     x: f32,

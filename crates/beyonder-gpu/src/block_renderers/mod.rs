@@ -65,7 +65,7 @@ pub fn measure_block_height(block: &Block, width: f32, font_size: f32) -> f32 {
                         .map(|line| {
                             let stripped = strip_md_markers(line);
                             let chars = stripped.chars().count().max(1);
-                            ((chars + chars_per_line - 1) / chars_per_line) as f32
+                            chars.div_ceil(chars_per_line) as f32
                         })
                         .sum::<f32>()
                         .max(1.0),
@@ -74,7 +74,7 @@ pub fn measure_block_height(block: &Block, width: f32, font_size: f32) -> f32 {
                         code.lines()
                             .map(|line| {
                                 let chars = line.chars().count().max(1);
-                                ((chars + chars_per_line - 1) / chars_per_line) as f32
+                                chars.div_ceil(chars_per_line) as f32
                             })
                             .sum::<f32>()
                             .max(1.0)

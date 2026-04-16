@@ -24,6 +24,7 @@ pub enum ApprovalDecision {
 }
 
 /// Events emitted by the broker.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum BrokerEvent {
     /// A new approval block that needs to be shown to the user.

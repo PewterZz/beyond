@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The core security primitive in Beyonder.
 /// Every action an agent wants to take requires a matching capability token.
@@ -20,7 +20,7 @@ impl Capability {
     }
 
     /// Check if this capability covers the given action kind and path.
-    pub fn covers_file_action(&self, action_kind: &CapabilityKind, path: &PathBuf) -> bool {
+    pub fn covers_file_action(&self, action_kind: &CapabilityKind, path: &Path) -> bool {
         if std::mem::discriminant(&self.kind) != std::mem::discriminant(action_kind) {
             return false;
         }
