@@ -263,6 +263,17 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(program);
         cmd.cwd(cwd);
         cmd.args(args);
+
+        // Inherit the parent's full environment. `CommandBuilder::new` starts
+        // with an empty env, so without this the child sees no $HOME / $PATH /
+        // $XDG_CONFIG_HOME — meaning `nvim` launches but can't find
+        // ~/.config/nvim (i.e. NvChad / user config doesn't load). The shell
+        // spawn path gets away without this because the shell repopulates
+        // $PATH etc. from its rc files; a direct exec doesn't.
+        for (k, v) in std::env::vars_os() {
+            cmd.env(k, v);
+        }
+
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "iTerm.app");
