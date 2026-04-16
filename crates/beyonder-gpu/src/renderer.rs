@@ -1419,7 +1419,7 @@ impl Renderer {
         // Re-insert shaped buffers that have cache keys back into the cache.
         // text_areas was consumed by prepare() so buf_list.entries is free to move.
         let fc = self.frame_counter;
-        for ((buf, ..), key) in buf_list.entries.into_iter().zip(buf_list.keys.into_iter()) {
+        for ((buf, ..), key) in buf_list.entries.into_iter().zip(buf_list.keys) {
             if let Some((id, len, bw, pf, vh)) = key {
                 self.glyph_buf_cache.insert(id, (len, bw, pf, vh, fc, buf));
             }
