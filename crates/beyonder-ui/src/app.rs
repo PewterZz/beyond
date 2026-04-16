@@ -2950,6 +2950,7 @@ impl App {
                 let (cur_row, cur_col) = self.term_grid.cursor_pos();
 
                 // Diff against previous frame — send only changed cells.
+                // Uses binary-packed variants for ~3x smaller payloads than CBOR.
                 let had_changes;
                 if let Some(changes) =
                     beyonder_remote::protocol::compute_frame_diff(&self.remote_prev_cells, &cells)
@@ -2957,36 +2958,41 @@ impl App {
                     let total_cells: usize = cells.iter().map(|r| r.len()).sum();
                     had_changes = !changes.is_empty();
                     if !changes.is_empty() && changes.len() < total_cells / 2 {
-                        let _ = hub.send(beyonder_remote::ServerMsg::PtyFrameDiff(
-                            beyonder_remote::PtyFrameDiff {
+                        let num = changes.len() as u32;
+                        let packed = beyonder_remote::protocol::pack_diff_changes(&changes);
+                        let _ = hub.send(beyonder_remote::ServerMsg::PtyFrameDiffPacked(
+                            beyonder_remote::PtyFrameDiffPacked {
                                 cursor_col: cur_col as u16,
                                 cursor_row: cur_row as u16,
-                                changes,
+                                num_changes: num,
+                                packed,
                             },
                         ));
                     } else if changes.is_empty() {
                         // No changes — skip sending entirely.
                     } else {
-                        let _ = hub.send(beyonder_remote::ServerMsg::PtyFrame(
-                            beyonder_remote::PtyFrame {
+                        let packed = beyonder_remote::protocol::pack_cells(&cells);
+                        let _ = hub.send(beyonder_remote::ServerMsg::PtyFramePacked(
+                            beyonder_remote::PtyFramePacked {
                                 cols: self.term_grid.cols as u16,
                                 rows: self.term_grid.rows as u16,
                                 cursor_col: cur_col as u16,
                                 cursor_row: cur_row as u16,
-                                cells: cells.clone(),
+                                packed,
                             },
                         ));
                     }
                 } else {
-                    // First frame or grid resized — send full.
+                    // First frame or grid resized — send full packed.
                     had_changes = true;
-                    let _ = hub.send(beyonder_remote::ServerMsg::PtyFrame(
-                        beyonder_remote::PtyFrame {
+                    let packed = beyonder_remote::protocol::pack_cells(&cells);
+                    let _ = hub.send(beyonder_remote::ServerMsg::PtyFramePacked(
+                        beyonder_remote::PtyFramePacked {
                             cols: self.term_grid.cols as u16,
                             rows: self.term_grid.rows as u16,
                             cursor_col: cur_col as u16,
                             cursor_row: cur_row as u16,
-                            cells: cells.clone(),
+                            packed,
                         },
                     ));
                 }

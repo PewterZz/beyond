@@ -9,6 +9,7 @@ tokio = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 ciborium = "0.2"
 tracing = { workspace = true }
 anyhow = { workspace = true }

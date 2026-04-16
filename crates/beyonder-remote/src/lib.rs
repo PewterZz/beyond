@@ -17,7 +17,8 @@ pub mod transport;
 
 pub use pairing::{PairingSecret, QrBitmap};
 pub use protocol::{
-    ClientMsg, ContentPatch, Hello, PtyCell, PtyFrame, PtyFrameDiff, ServerMsg, TabInfo, TabList,
+    ClientMsg, ContentPatch, Hello, PtyCell, PtyFrame, PtyFrameDiff, PtyFrameDiffPacked,
+    PtyFramePacked, ServerMsg, TabInfo, TabList,
 };
 pub use transport::{detect_tailscale_host, NgrokTunnel};
 

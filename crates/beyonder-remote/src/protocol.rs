@@ -53,6 +53,10 @@ pub enum ServerMsg {
     PtyFrame(PtyFrame),
     /// Incremental PTY update — only changed cells since last frame.
     PtyFrameDiff(PtyFrameDiff),
+    /// Binary-packed full frame — same as PtyFrame but cells are a compact blob.
+    PtyFramePacked(PtyFramePacked),
+    /// Binary-packed diff — same as PtyFrameDiff but changes are a compact blob.
+    PtyFrameDiffPacked(PtyFrameDiffPacked),
     /// Full list of tabs — sent on connect and whenever tabs change.
     TabList(TabList),
     /// Active tab changed (index into the tab list).
@@ -98,6 +102,27 @@ pub struct PtyFrameDiff {
     pub cursor_row: u16,
     /// Changed cells: (row, col, cell).
     pub changes: Vec<(u16, u16, PtyCell)>,
+}
+
+/// Binary-packed full frame. Cells are encoded as a flat byte blob via `pack_cells`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyFramePacked {
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_col: u16,
+    pub cursor_row: u16,
+    #[serde(with = "serde_bytes")]
+    pub packed: Vec<u8>,
+}
+
+/// Binary-packed diff. Changes encoded as a flat byte blob via `pack_diff_changes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyFrameDiffPacked {
+    pub cursor_col: u16,
+    pub cursor_row: u16,
+    pub num_changes: u32,
+    #[serde(with = "serde_bytes")]
+    pub packed: Vec<u8>,
 }
 
 /// Phone → server.
@@ -214,6 +239,182 @@ impl AdaptiveThrottle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentPatch {
     pub text_append: Option<String>,
+}
+
+// ── Binary cell packing ──────────────────────────────────────────────
+//
+// CBOR encodes each PtyCell as a tagged map with field names, adding ~15-20
+// bytes of overhead per cell. For a 80×24 grid that's 29-38 KB of pure
+// overhead. The packed format below uses a flat byte buffer:
+//
+//   Per cell: [flags:u8] [fg:3B] [bg:3B if HAS_BG] [glyph_len:u8] [glyph:NB]
+//
+//   flags: bit 0 = bold, bit 1 = has_bg
+//
+// A typical space cell is 6 bytes (flags + fg + len=1 + " ") vs ~20 in CBOR.
+
+const FLAG_BOLD: u8 = 0x01;
+const FLAG_HAS_BG: u8 = 0x02;
+
+/// Pack a grid of cells into a compact binary blob.
+pub fn pack_cells(cells: &[Vec<PtyCell>]) -> Vec<u8> {
+    let total: usize = cells.iter().map(|r| r.len()).sum();
+    // Estimate ~8 bytes per cell.
+    let mut buf = Vec::with_capacity(total * 8);
+    for row in cells {
+        for cell in row {
+            let mut flags = 0u8;
+            if cell.bold {
+                flags |= FLAG_BOLD;
+            }
+            if cell.bg.is_some() {
+                flags |= FLAG_HAS_BG;
+            }
+            buf.push(flags);
+            buf.extend_from_slice(&cell.fg);
+            if let Some(bg) = &cell.bg {
+                buf.extend_from_slice(bg);
+            }
+            let g = cell.g.as_bytes();
+            buf.push(g.len() as u8);
+            buf.extend_from_slice(g);
+        }
+    }
+    buf
+}
+
+/// Unpack a binary blob back into a grid of cells.
+pub fn unpack_cells(data: &[u8], rows: usize, cols: usize) -> Option<Vec<Vec<PtyCell>>> {
+    let mut pos = 0;
+    let mut grid = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let mut row = Vec::with_capacity(cols);
+        for _ in 0..cols {
+            if pos >= data.len() {
+                return None;
+            }
+            let flags = data[pos];
+            pos += 1;
+            if pos + 3 > data.len() {
+                return None;
+            }
+            let fg = [data[pos], data[pos + 1], data[pos + 2]];
+            pos += 3;
+            let bg = if flags & FLAG_HAS_BG != 0 {
+                if pos + 3 > data.len() {
+                    return None;
+                }
+                let b = [data[pos], data[pos + 1], data[pos + 2]];
+                pos += 3;
+                Some(b)
+            } else {
+                None
+            };
+            if pos >= data.len() {
+                return None;
+            }
+            let g_len = data[pos] as usize;
+            pos += 1;
+            if pos + g_len > data.len() {
+                return None;
+            }
+            let g = std::str::from_utf8(&data[pos..pos + g_len])
+                .ok()?
+                .to_string();
+            pos += g_len;
+            row.push(PtyCell {
+                g,
+                fg,
+                bg,
+                bold: flags & FLAG_BOLD != 0,
+            });
+        }
+        grid.push(row);
+    }
+    Some(grid)
+}
+
+/// Pack diff changes into a compact binary blob.
+/// Format: [row:u16 LE][col:u16 LE][cell packed as above] per change.
+pub fn pack_diff_changes(changes: &[(u16, u16, PtyCell)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(changes.len() * 12);
+    for (r, c, cell) in changes {
+        buf.extend_from_slice(&r.to_le_bytes());
+        buf.extend_from_slice(&c.to_le_bytes());
+        let mut flags = 0u8;
+        if cell.bold {
+            flags |= FLAG_BOLD;
+        }
+        if cell.bg.is_some() {
+            flags |= FLAG_HAS_BG;
+        }
+        buf.push(flags);
+        buf.extend_from_slice(&cell.fg);
+        if let Some(bg) = &cell.bg {
+            buf.extend_from_slice(bg);
+        }
+        let g = cell.g.as_bytes();
+        buf.push(g.len() as u8);
+        buf.extend_from_slice(g);
+    }
+    buf
+}
+
+/// Unpack diff changes from a binary blob.
+pub fn unpack_diff_changes(data: &[u8]) -> Option<Vec<(u16, u16, PtyCell)>> {
+    let mut pos = 0;
+    let mut changes = vec![];
+    while pos < data.len() {
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let r = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        let c = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        if pos >= data.len() {
+            return None;
+        }
+        let flags = data[pos];
+        pos += 1;
+        if pos + 3 > data.len() {
+            return None;
+        }
+        let fg = [data[pos], data[pos + 1], data[pos + 2]];
+        pos += 3;
+        let bg = if flags & FLAG_HAS_BG != 0 {
+            if pos + 3 > data.len() {
+                return None;
+            }
+            let b = [data[pos], data[pos + 1], data[pos + 2]];
+            pos += 3;
+            Some(b)
+        } else {
+            None
+        };
+        if pos >= data.len() {
+            return None;
+        }
+        let g_len = data[pos] as usize;
+        pos += 1;
+        if pos + g_len > data.len() {
+            return None;
+        }
+        let g = std::str::from_utf8(&data[pos..pos + g_len])
+            .ok()?
+            .to_string();
+        pos += g_len;
+        changes.push((
+            r,
+            c,
+            PtyCell {
+                g,
+                fg,
+                bg,
+                bold: flags & FLAG_BOLD != 0,
+            },
+        ));
+    }
+    Some(changes)
 }
 
 /// Magic byte prefixed to zstd-compressed frames.
@@ -457,5 +658,124 @@ mod tests {
         t.reset();
         assert_eq!(t.interval_ms, 100);
         assert_eq!(t.idle_frames, 0);
+    }
+
+    #[test]
+    fn pack_unpack_cells_roundtrip() {
+        let cells = vec![
+            vec![cell(" ", false), cell("A", true)],
+            vec![
+                PtyCell {
+                    g: "B".into(),
+                    fg: [0, 255, 0],
+                    bg: Some([10, 20, 30]),
+                    bold: false,
+                },
+                cell("C", false),
+            ],
+        ];
+        let packed = pack_cells(&cells);
+        let unpacked = unpack_cells(&packed, 2, 2).expect("unpack should succeed");
+        assert_eq!(cells, unpacked);
+    }
+
+    #[test]
+    fn pack_unpack_diff_roundtrip() {
+        let changes = vec![
+            (0u16, 5u16, cell("X", true)),
+            (
+                3,
+                10,
+                PtyCell {
+                    g: "Y".into(),
+                    fg: [128, 0, 255],
+                    bg: Some([1, 2, 3]),
+                    bold: false,
+                },
+            ),
+        ];
+        let packed = pack_diff_changes(&changes);
+        let unpacked = unpack_diff_changes(&packed).expect("unpack should succeed");
+        assert_eq!(changes, unpacked);
+    }
+
+    #[test]
+    fn packed_frame_smaller_than_cbor_frame() {
+        let cells = grid(24, 80, " ");
+        // CBOR size of the old PtyFrame variant.
+        let cbor_msg = ServerMsg::PtyFrame(PtyFrame {
+            cols: 80,
+            rows: 24,
+            cursor_col: 0,
+            cursor_row: 0,
+            cells: cells.clone(),
+        });
+        let mut cbor_buf = Vec::new();
+        ciborium::into_writer(&cbor_msg, &mut cbor_buf).unwrap();
+
+        // Packed size.
+        let packed_data = pack_cells(&cells);
+        let packed_msg = ServerMsg::PtyFramePacked(PtyFramePacked {
+            cols: 80,
+            rows: 24,
+            cursor_col: 0,
+            cursor_row: 0,
+            packed: packed_data,
+        });
+        let mut packed_buf = Vec::new();
+        ciborium::into_writer(&packed_msg, &mut packed_buf).unwrap();
+
+        assert!(
+            packed_buf.len() < cbor_buf.len(),
+            "packed ({}) should be smaller than CBOR ({}), saving {}%",
+            packed_buf.len(),
+            cbor_buf.len(),
+            100 - (packed_buf.len() * 100 / cbor_buf.len())
+        );
+    }
+
+    #[test]
+    fn packed_diff_smaller_than_cbor_diff() {
+        let changes: Vec<(u16, u16, PtyCell)> = (0..50)
+            .map(|i| (i / 10, i % 10, cell("X", i % 2 == 0)))
+            .collect();
+
+        let cbor_msg = ServerMsg::PtyFrameDiff(PtyFrameDiff {
+            cursor_col: 0,
+            cursor_row: 0,
+            changes: changes.clone(),
+        });
+        let mut cbor_buf = Vec::new();
+        ciborium::into_writer(&cbor_msg, &mut cbor_buf).unwrap();
+
+        let packed_data = pack_diff_changes(&changes);
+        let packed_msg = ServerMsg::PtyFrameDiffPacked(PtyFrameDiffPacked {
+            cursor_col: 0,
+            cursor_row: 0,
+            num_changes: changes.len() as u32,
+            packed: packed_data,
+        });
+        let mut packed_buf = Vec::new();
+        ciborium::into_writer(&packed_msg, &mut packed_buf).unwrap();
+
+        assert!(
+            packed_buf.len() < cbor_buf.len(),
+            "packed diff ({}) should be smaller than CBOR diff ({})",
+            packed_buf.len(),
+            cbor_buf.len()
+        );
+    }
+
+    #[test]
+    fn pack_handles_multibyte_graphemes() {
+        let cells = vec![vec![PtyCell {
+            g: "🦀".into(),
+            fg: [255, 128, 0],
+            bg: None,
+            bold: true,
+        }]];
+        let packed = pack_cells(&cells);
+        let unpacked = unpack_cells(&packed, 1, 1).unwrap();
+        assert_eq!(cells, unpacked);
     }
 }
