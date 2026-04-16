@@ -8,14 +8,17 @@ An AI-native terminal written in Rust. Beyond replaces the traditional scroll bu
 
 - **Blocks, not scrollback.** Shell commands, agent turns, and approvals are all `Block`s with ULID IDs, parent/child relationships, and a provenance chain.
 - **Agents as processes.** The `AgentSupervisor` spawns, monitors, and kills agents. Each has a `CapabilitySet` and `ResourceLimits`; tool calls flow through a `CapabilityBroker`.
-- **Ollama-first.** Local models and Ollama Turbo share one backend. No cloud-provider SDKs in the core.
+- **Multi-provider LLM support.** Ollama (local + Cloud/Turbo), llama.cpp, and Apple MLX — switch at runtime with `/provider`.
 - **GPU rendering.** Single `winit` window, `wgpu` 24, `glyphon` 0.8 for text, custom per-block renderers.
 - **OSC-133 shell integration.** `zsh`/`bash` hooks let Beyond see where one command ends and the next begins.
 
 ## Requirements
 
 - A GPU that supports `wgpu` (Metal on macOS, Vulkan/DX12 elsewhere)
-- [`ollama`](https://ollama.com) running locally (`ollama serve`) — required for agent features
+- At least one LLM provider running for agent features:
+  - [Ollama](https://ollama.com) — `ollama serve` (local) or Ollama Cloud (Turbo)
+  - [llama.cpp](https://github.com/ggerganov/llama.cpp) — `llama-server -m model.gguf --jinja -c 8192`
+  - [Apple MLX](https://github.com/ml-explore/mlx-lm) — `mlx_lm.server --model <id>` (macOS Apple Silicon)
 
 ## Installation
 
@@ -86,7 +89,7 @@ The workspace binary is a thin `winit::ApplicationHandler` that owns the tokio r
 | `beyonder-store` | SQLite persistence (bundled `rusqlite`): `BlockStore`, `SessionStore`, migrations. |
 | `beyonder-terminal` | PTY (`portable-pty`) + terminal emulation (`alacritty_terminal`), OSC-133 shell hooks, `BlockBuilder`. |
 | `beyonder-acp` | Agent Client Protocol: messages, transport, `AcpClient`. |
-| `beyonder-runtime` | `AgentSupervisor`, `CapabilityBroker`, tool registry, `AgentBackend` trait + Ollama impl. |
+| `beyonder-runtime` | `AgentSupervisor`, `CapabilityBroker`, tool registry, `AgentBackend` trait + Ollama/llama.cpp/MLX providers. |
 | `beyonder-gpu` | `wgpu` renderer, `glyphon` text atlas, per-block renderers, viewport/scrolling. |
 | `beyonder-ui` | `App` wiring, input editor, slash commands, history, mode detection. |
 | `beyonder-config` | TOML config loader (`BeyonderConfig`). |
@@ -98,6 +101,28 @@ See [`CLAUDE.md`](./CLAUDE.md) for a deeper tour written for AI coding assistant
 ## Configuration
 
 Config lives at `$XDG_CONFIG_HOME/beyond/config.toml` (or the platform equivalent). Missing or malformed config falls back to defaults — see `BeyonderConfig::load_or_default`.
+
+### LLM Providers
+
+```toml
+# Ollama (default)
+[provider]
+kind = "ollama"
+base_url = "http://localhost:11434"       # optional; cloud: "https://ollama.com"
+api_key_env = "OLLAMA_API_KEY"            # optional; omit for local
+
+# llama.cpp
+[provider]
+kind = "llama_cpp"
+base_url = "http://127.0.0.1:8080/v1"
+
+# Apple MLX (macOS Apple Silicon)
+[provider]
+kind = "mlx"
+base_url = "http://127.0.0.1:8080/v1"
+```
+
+Switch at runtime with `/provider ollama|llama_cpp|mlx` and `/model <name>`. Changes take effect on the next agent spawn.
 
 ## Contributing
 
