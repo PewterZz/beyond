@@ -101,6 +101,116 @@ fn find_editor() -> Option<String> {
     None
 }
 
+/// Spawn a small separate terminal window running `editor <path>`.
+/// Returns the name of the terminal emulator that was launched.
+///
+/// Tries terminals in order of preference (compact sizing flags where
+/// supported, so the window lands as a small popup rather than 80×24
+/// or maximized).
+fn spawn_editor_window(editor: &str, path: &std::path::Path) -> anyhow::Result<&'static str> {
+    use std::process::{Command, Stdio};
+
+    // Reasonable "small popup" dimensions.
+    const COLS: u32 = 110;
+    const ROWS: u32 = 34;
+    const WIN_W: u32 = 900;
+    const WIN_H: u32 = 600;
+
+    let quoted = shell_quote(path);
+    let shell_cmd = format!("{editor} {quoted}");
+
+    // kitty: `-o KEY=VALUE` sets a runtime config value. Sizes in `Nc` are
+    // cell counts, which give a predictable popup regardless of font scale.
+    if binary_in_path("kitty") {
+        Command::new("kitty")
+            .args([
+                "-o",
+                &format!("initial_window_width={COLS}c"),
+                "-o",
+                &format!("initial_window_height={ROWS}c"),
+                "-o",
+                "remember_window_size=no",
+            ])
+            .arg(editor)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok("kitty");
+    }
+
+    // alacritty: column/line dims via --option; -e consumes the trailing command.
+    if binary_in_path("alacritty") {
+        Command::new("alacritty")
+            .args([
+                "--option",
+                &format!("window.dimensions.columns={COLS}"),
+                "--option",
+                &format!("window.dimensions.lines={ROWS}"),
+                "-e",
+                "sh",
+                "-c",
+                &shell_cmd,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok("alacritty");
+    }
+
+    // ghostty: no reliable CLI window-size flag, but opens at its configured
+    // default which is usually reasonable. `-e` must come last; rest is argv.
+    if binary_in_path("ghostty") {
+        Command::new("ghostty")
+            .args(["-e", editor, path.to_string_lossy().as_ref()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok("ghostty");
+    }
+
+    if binary_in_path("wezterm") {
+        Command::new("wezterm")
+            .args(["start", "--", "sh", "-c", &shell_cmd])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok("wezterm");
+    }
+
+    // macOS fallback: drive Terminal.app via AppleScript so we can size the window.
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            r#"tell application "Terminal"
+                activate
+                set newTab to do script "{cmd}"
+                set bounds of front window to {{200, 200, {right}, {bottom}}}
+            end tell"#,
+            cmd = shell_cmd.replace('\\', "\\\\").replace('"', "\\\""),
+            right = 200 + WIN_W,
+            bottom = 200 + WIN_H,
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        return Ok("Terminal.app");
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "no compatible terminal emulator found (tried ghostty, kitty, alacritty, wezterm)"
+    ))
+}
+
 /// True iff `name` is an executable file in one of the directories on $PATH.
 fn binary_in_path(name: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
@@ -929,8 +1039,12 @@ impl App {
         self.broadcast_tab_list();
     }
 
-    /// Open `path` in $VISUAL/$EDITOR (or nvim/vim/nano) inside a fresh tab.
-    /// If no editor is installed, surfaces an install hint instead of silently failing.
+    /// Open `path` in $VISUAL/$EDITOR (or nvim/vim/nano) in a *separate*
+    /// small terminal window. Tries ghostty → kitty → alacritty → wezterm →
+    /// Terminal.app (macOS) in that order.
+    ///
+    /// If nothing usable is found, surfaces an install hint instead of
+    /// silently failing.
     pub fn open_file_in_editor(&mut self, path: PathBuf) {
         let Some(editor) = find_editor() else {
             self.push_text_block(
@@ -939,25 +1053,12 @@ impl App {
             );
             return;
         };
-        self.new_tab();
-        // Rename the tab to the file's basename for clarity.
-        let title = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{}", self.active_tab + 1));
-        if let Some(slot) = self.tab_titles.get_mut(self.active_tab) {
-            *slot = title;
+        match spawn_editor_window(&editor, &path) {
+            Ok(term) => info!(term, file = %path.display(), "Opened file in external editor window"),
+            Err(e) => self.push_text_block(format!(
+                "Couldn't open an editor window: {e}. Install ghostty, kitty, alacritty, or wezterm."
+            )),
         }
-        // Write the editor invocation to the new PTY. The shell will read it
-        // once it finishes sourcing rc files and prints its prompt.
-        let cmd = format!("{} {}\n", editor, shell_quote(&path));
-        if let Some(pty) = &mut self.pty {
-            if let Err(e) = pty.write(cmd.as_bytes()) {
-                error!("Failed to write editor command to PTY: {e}");
-            }
-        }
-        self.broadcast_tab_list();
     }
 
     /// Close the active tab. Falls back to adjacent tab; if it was the last tab,
