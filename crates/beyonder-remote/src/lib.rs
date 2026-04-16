@@ -16,7 +16,9 @@ pub mod server;
 pub mod transport;
 
 pub use pairing::{PairingSecret, QrBitmap};
-pub use protocol::{ClientMsg, ContentPatch, Hello, PtyCell, PtyFrame, ServerMsg, TabInfo, TabList};
+pub use protocol::{
+    ClientMsg, ContentPatch, Hello, PtyCell, PtyFrame, PtyFrameDiff, ServerMsg, TabInfo, TabList,
+};
 pub use transport::{detect_tailscale_host, NgrokTunnel};
 
 use anyhow::Result;
@@ -65,7 +67,10 @@ impl RemoteHub {
             .unwrap_or_default();
         let qr_bitmap = secret
             .qr_bitmap(&host, handle.port, false)
-            .unwrap_or(QrBitmap { width: 0, modules: vec![] });
+            .unwrap_or(QrBitmap {
+                width: 0,
+                modules: vec![],
+            });
 
         let mdns = mdns::MdnsHandle::announce(handle.port, "beyonder").ok();
         if mdns.is_none() {
@@ -101,14 +106,11 @@ impl RemoteHub {
     /// token stay the same; only what the phone dials changes.
     pub fn set_endpoint(&mut self, host: &str, port: u16, tls: bool, label: String) {
         self.pairing_url = self.secret.pairing_url(host, port, tls);
-        self.qr_ascii = self
-            .secret
-            .qr_ascii(host, port, tls)
-            .unwrap_or_default();
-        self.qr_bitmap = self
-            .secret
-            .qr_bitmap(host, port, tls)
-            .unwrap_or(QrBitmap { width: 0, modules: vec![] });
+        self.qr_ascii = self.secret.qr_ascii(host, port, tls).unwrap_or_default();
+        self.qr_bitmap = self.secret.qr_bitmap(host, port, tls).unwrap_or(QrBitmap {
+            width: 0,
+            modules: vec![],
+        });
         self.endpoint_label = label;
     }
 
