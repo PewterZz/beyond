@@ -27,7 +27,6 @@ fn main() -> Result<()> {
     info!("Beyond starting");
     let config = BeyonderConfig::load_or_default();
 
-
     let event_loop = EventLoop::<()>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -198,14 +197,12 @@ fn set_macos_dock_icon() {
     unsafe {
         let ptr = ICON_PNG.as_ptr() as *const c_void;
         let len = ICON_PNG.len();
-        let data: Retained<AnyObject> =
-            msg_send_id![class!(NSData), dataWithBytes:ptr length:len];
+        let data: Retained<AnyObject> = msg_send_id![class!(NSData), dataWithBytes:ptr length:len];
 
         let image: Retained<AnyObject> =
             msg_send_id![msg_send_id![class!(NSImage), alloc], initWithData:&*data];
 
-        let app: Retained<AnyObject> =
-            msg_send_id![class!(NSApplication), sharedApplication];
+        let app: Retained<AnyObject> = msg_send_id![class!(NSApplication), sharedApplication];
         let () = msg_send![&*app, setApplicationIconImage:&*image];
     }
 }
