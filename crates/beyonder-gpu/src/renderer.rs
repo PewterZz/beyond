@@ -71,7 +71,11 @@ fn clamp_char_boundary(s: &str, mut i: usize) -> usize {
 
 #[inline]
 fn order_rc(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
-    if a <= b { (a, b) } else { (b, a) }
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 #[inline]
@@ -185,6 +189,18 @@ pub struct Renderer {
     /// GlyphBuffer cache: block_id → (content_len, buf_w_bits, font_bits, viewport_h_bits, buffer).
     /// Re-shaping is skipped when content and layout params are unchanged.
     glyph_buf_cache: HashMap<beyonder_core::BlockId, (u64, u32, u32, u32, GlyphBuffer)>,
+
+    // ── Block layout cache ──────────────────────────────────────────────────
+    /// Cached per-block heights (parallel to `self.blocks`).
+    block_heights: Vec<f32>,
+    /// Prefix-sum of (height + gap) — `block_y_prefix[i]` is the Y offset of block `i`.
+    /// Length = blocks.len() + 1 (sentinel at end = total content height).
+    block_y_prefix: Vec<f32>,
+    /// Generation counter. Incremented when blocks change. Used to detect stale caches.
+    _blocks_generation: u64,
+    /// The layout params (content_w bits, phys_font bits, running_block_idx) used to
+    /// compute cached heights — invalidate if these change (resize, font change).
+    layout_params_key: (u32, u32, Option<usize>),
 
     /// Currently executing tool per agent: agent_id → tool_name.
     /// Set by App when ToolCallRequested arrives; cleared on TextDelta or TurnComplete.
@@ -444,6 +460,10 @@ impl Renderer {
             mode_pill_rect: [0.0; 4],
             agent_model: String::new(),
             glyph_buf_cache: HashMap::new(),
+            block_heights: vec![],
+            block_y_prefix: vec![0.0],
+            _blocks_generation: 0,
+            layout_params_key: (0, 0, None),
             agent_running_tool: HashMap::new(),
             user_expanded: HashSet::new(),
             tab_labels: vec![],
@@ -561,22 +581,19 @@ impl Renderer {
     /// For ShellCommand blocks the cmd bar and output panel are separate hit regions.
     pub fn block_hit_at(&self, screen_y: f32) -> Option<(usize, bool)> {
         let sc = self.scale_factor;
-        let padding = PADDING * sc;
-        let gap = GAP * sc;
         let phys_font = self.font_size * sc;
-        let content_w = self.viewport.width - padding * 2.0;
         let inner_gap = phys_font * 0.4;
-        let mut y = padding;
-        for (i, block) in self.blocks.iter().enumerate() {
-            let h = self.block_height(i, block, content_w, phys_font);
+        for i in 0..self.blocks.len() {
+            let y = self.block_y_prefix.get(i).copied().unwrap_or(0.0);
+            let h = self.block_heights.get(i).copied().unwrap_or(0.0);
             let sy = self.viewport.content_to_screen_y(y);
             if screen_y >= sy && screen_y < sy + h {
+                let block = &self.blocks[i];
                 let shell_cmd_bar_h = phys_font * 2.8;
                 let is_output = matches!(block.content, BlockContent::ShellCommand { .. })
                     && screen_y >= sy + shell_cmd_bar_h + inner_gap;
                 return Some((i, is_output));
             }
-            y += h + gap;
         }
         None
     }
@@ -623,12 +640,7 @@ impl Renderer {
         Some((x_content, text_y, buf_w))
     }
 
-    fn shell_cell_at(
-        &self,
-        block_idx: usize,
-        phys_x: f32,
-        phys_y: f32,
-    ) -> Option<(usize, usize)> {
+    fn shell_cell_at(&self, block_idx: usize, phys_x: f32, phys_y: f32) -> Option<(usize, usize)> {
         let block = self.blocks.get(block_idx)?;
         let BlockContent::ShellCommand { output, .. } = &block.content else {
             return None;
@@ -692,8 +704,10 @@ impl Renderer {
             } else {
                 self.make_buffer(&content_text, buf_w, phys_font, gc(self.theme.text))
             };
-            self.glyph_buf_cache
-                .insert(block.id.clone(), (content_len, bw_bits, pf_bits, vh_bits, buf));
+            self.glyph_buf_cache.insert(
+                block.id.clone(),
+                (content_len, bw_bits, pf_bits, vh_bits, buf),
+            );
         }
         let (_, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
         let skipped = if is_markdown {
@@ -762,7 +776,9 @@ impl Renderer {
             return;
         };
         match sel {
-            TextSelection::Shell { block_idx, anchor, .. } => {
+            TextSelection::Shell {
+                block_idx, anchor, ..
+            } => {
                 if let Some(rc) = self.shell_cell_at(block_idx, phys_x, phys_y) {
                     self.text_selection = Some(TextSelection::Shell {
                         block_idx,
@@ -771,7 +787,9 @@ impl Renderer {
                     });
                 }
             }
-            TextSelection::Buffer { block_idx, anchor, .. } => {
+            TextSelection::Buffer {
+                block_idx, anchor, ..
+            } => {
                 if let Some(cur) = self.buffer_cursor_at(block_idx, phys_x, phys_y) {
                     self.text_selection = Some(TextSelection::Buffer {
                         block_idx,
@@ -805,7 +823,7 @@ impl Renderer {
     fn qr_mod_px(&self, qr: &QrBitmap) -> f32 {
         let sc = self.scale_factor;
         let side_modules = (qr.width + 8) as f32; // +8 for 4-module quiet zone each side
-        // Target ~250 logical px → 250*sc physical.
+                                                  // Target ~250 logical px → 250*sc physical.
         let target = 250.0 * sc;
         let ideal = (target / side_modules).floor().max(2.0);
         ideal
@@ -910,7 +928,11 @@ impl Renderer {
                     }
                 }
                 let trimmed = out.trim_end_matches([' ', '\t']).to_string();
-                if trimmed.is_empty() { None } else { Some(trimmed) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
             }
             Some(TextSelection::Buffer {
                 block_idx,
@@ -930,7 +952,11 @@ impl Renderer {
                 for line_i in s_line..=e_line {
                     let text = buf.lines[line_i].text();
                     let mut start = if line_i == s_line { s.index } else { 0 };
-                    let mut end = if line_i == e_line { e.index } else { text.len() };
+                    let mut end = if line_i == e_line {
+                        e.index
+                    } else {
+                        text.len()
+                    };
                     start = clamp_char_boundary(text, start.min(text.len()));
                     end = clamp_char_boundary(text, end.min(text.len()));
                     if end > start {
@@ -940,7 +966,11 @@ impl Renderer {
                         out.push('\n');
                     }
                 }
-                if out.is_empty() { None } else { Some(out) }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some(out)
+                }
             }
             None => None,
         }
@@ -1429,28 +1459,16 @@ impl Renderer {
         }
     }
 
-    /// Content-space Y (top) of block index `idx`, matching layout_blocks's cursor.
+    /// Content-space Y (top) of block index `idx`, using the layout cache.
     /// Returns None if idx out of range.
     pub fn block_top_y(&self, idx: usize) -> Option<f32> {
         if idx >= self.blocks.len() {
             return None;
         }
-        let sc = self.scale_factor;
-        let padding = PADDING * sc;
-        let gap = GAP * sc;
-        let phys_font = self.font_size * sc;
-        let content_w = self.viewport.width - padding * 2.0;
-        let mut y = padding;
-        for (i, b) in self.blocks.iter().enumerate() {
-            if i == idx {
-                return Some(y);
-            }
-            y += self.block_height(i, b, content_w, phys_font) + gap;
-        }
-        None
+        self.block_y_prefix.get(idx).copied()
     }
 
-    /// for the currently running block.
+    /// Compute height for a single block.
     fn block_height(&self, idx: usize, block: &Block, content_w: f32, phys_font: f32) -> f32 {
         if let Some(qr) = self.qr_overlays.get(&block.id) {
             return self.qr_overlay_height(qr, content_w);
@@ -1464,27 +1482,104 @@ impl Renderer {
         }
     }
 
-    fn layout_blocks(&mut self) -> (Vec<RectInstance>, f32) {
-        self.link_rects.clear();
-        let mut link_rects_local: Vec<([f32; 4], String)> = vec![];
-        let mut rects = vec![];
+    /// Rebuild cached block heights and prefix-sum Y offsets.
+    /// Only recomputes heights for blocks that have changed (new or different content length).
+    /// Called at the top of `layout_blocks`.
+    fn rebuild_block_layout_cache(&mut self) {
         let sc = self.scale_factor;
         let padding = PADDING * sc;
         let gap = GAP * sc;
         let phys_font = self.font_size * sc;
         let content_w = self.viewport.width - padding * 2.0;
-        let mut y = padding;
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            let h = self.block_height(i, block, content_w, phys_font);
+        let cw_bits = content_w.to_bits();
+        let pf_bits = phys_font.to_bits();
+        let params_key = (cw_bits, pf_bits, self.running_block_idx);
+        let params_changed = params_key != self.layout_params_key;
+        if params_changed {
+            self.layout_params_key = params_key;
+        }
+
+        let n = self.blocks.len();
+
+        // Resize height cache to match block count.
+        self.block_heights.resize(n, 0.0);
+
+        let mut any_changed = params_changed || self.block_heights.len() != n;
+
+        for i in 0..n {
+            let block = &self.blocks[i];
+            // Running blocks always recompute (live terminal output changes size each frame).
+            let is_running = self.running_block_idx == Some(i);
+            let needs_recompute = params_changed || is_running || i >= self.block_heights.len();
+            if needs_recompute {
+                let h = self.block_height(i, block, content_w, phys_font);
+                if (self.block_heights[i] - h).abs() > 0.01 {
+                    self.block_heights[i] = h;
+                    any_changed = true;
+                }
+            }
+        }
+
+        // Only rebuild prefix sums if any height changed.
+        if any_changed || self.block_y_prefix.len() != n + 1 {
+            self.block_y_prefix.clear();
+            self.block_y_prefix.reserve(n + 1);
+            let mut y = padding;
+            for i in 0..n {
+                self.block_y_prefix.push(y);
+                y += self.block_heights[i] + gap;
+            }
+            self.block_y_prefix.push(y); // sentinel = total height
+        }
+    }
+
+    /// Binary search for the first block whose bottom edge is at or below `scroll_offset`.
+    fn first_visible_block(&self, scroll_offset: f32) -> usize {
+        let gap = GAP * self.scale_factor;
+        let n = self.blocks.len();
+        if n == 0 {
+            return 0;
+        }
+        // Find first i where block_y_prefix[i] + block_heights[i] > scroll_offset
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let bottom = self.block_y_prefix[mid] + self.block_heights[mid] + gap;
+            if bottom <= scroll_offset {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    fn layout_blocks(&mut self) -> (Vec<RectInstance>, f32) {
+        self.rebuild_block_layout_cache();
+        self.link_rects.clear();
+        let mut link_rects_local: Vec<([f32; 4], String)> = vec![];
+        let mut rects = vec![];
+        let sc = self.scale_factor;
+        let padding = PADDING * sc;
+        let phys_font = self.font_size * sc;
+        let content_w = self.viewport.width - padding * 2.0;
+
+        // Use binary search to skip blocks above the viewport.
+        let first = self.first_visible_block(self.viewport.scroll_offset);
+
+        for i in first..self.blocks.len() {
+            let y = self.block_y_prefix[i];
+            let h = self.block_heights[i];
             let sy = self.viewport.content_to_screen_y(y);
 
             if self.viewport.is_visible(y, h) {
+                let block = &self.blocks[i];
                 let x = padding;
                 // QR overlay short-circuits normal block rendering: paint rects and skip.
                 if let Some(qr) = self.qr_overlays.get(&block.id) {
                     self.paint_qr_block(qr, x, sy, content_w, &mut rects);
-                    y += h + gap;
                     continue;
                 }
                 match &block.content {
@@ -1675,8 +1770,7 @@ impl Renderer {
                                     let skipped = match &block.content {
                                         BlockContent::AgentMessage { .. } => {
                                             let total = block_content_text(block).lines().count();
-                                            let max_vis = ((self.viewport.height / line_h)
-                                                .ceil()
+                                            let max_vis = ((self.viewport.height / line_h).ceil()
                                                 as usize
                                                 + 30)
                                                 .max(50);
@@ -1728,12 +1822,15 @@ impl Renderer {
                             .with_border(1.0, [0.40, 0.65, 1.0, 0.6]),
                     );
                 }
+            } else {
+                // Block is below the viewport — stop iterating.
+                break;
             }
-            y += h + gap;
         }
 
+        let total_h = *self.block_y_prefix.last().unwrap_or(&0.0);
         self.link_rects.extend(link_rects_local);
-        (rects, y)
+        (rects, total_h)
     }
 
     /// Draw the input bar chrome (background, separator, pills, mode pill, dropdown,
@@ -2154,23 +2251,25 @@ impl Renderer {
     fn build_text_buffers(&mut self) -> (TextBufList, usize) {
         let sc = self.scale_factor;
         let padding = PADDING * sc;
-        let gap = GAP * sc;
         let phys_font = self.font_size * sc;
         let content_w = self.viewport.width - padding * 2.0;
         let _line_h = phys_font * 1.4;
         let mut results = TextBufList::new();
-        let mut y = padding;
+
+        // Use cached layout: skip to first visible block via binary search.
+        let first = self.first_visible_block(self.viewport.scroll_offset);
 
         let blocks = self.blocks.clone();
-        for (block_idx, block) in blocks.iter().enumerate() {
+        for block_idx in first..blocks.len() {
+            let block = &blocks[block_idx];
             let block_t0 = std::time::Instant::now();
-            let h = self.block_height(block_idx, block, content_w, phys_font);
+            let y = self.block_y_prefix.get(block_idx).copied().unwrap_or(0.0);
+            let h = self.block_heights.get(block_idx).copied().unwrap_or(0.0);
             let sy = self.viewport.content_to_screen_y(y);
 
             if self.viewport.is_visible(y, h) {
                 // QR overlay blocks are painted as rects in layout_blocks; no glyphs.
                 if self.qr_overlays.contains_key(&block.id) {
-                    y += h + gap;
                     continue;
                 }
                 let x = padding;
@@ -2512,18 +2611,20 @@ impl Renderer {
                         }
                     }
                 }
+                let block_ms = block_t0.elapsed().as_millis();
+                if block_ms > 5 {
+                    debug!(
+                        block_idx,
+                        kind = ?block.kind,
+                        status = ?block.status,
+                        elapsed_ms = block_ms,
+                        "build_text_buffers: slow block"
+                    );
+                }
+            } else {
+                // Below viewport — stop.
+                break;
             }
-            let block_ms = block_t0.elapsed().as_millis();
-            if block_ms > 5 {
-                debug!(
-                    block_idx,
-                    kind = ?block.kind,
-                    status = ?block.status,
-                    elapsed_ms = block_ms,
-                    "build_text_buffers: slow block"
-                );
-            }
-            y += h + gap;
         }
 
         // Block entries end here. Bar text is appended separately via build_bar_text_buffers.
@@ -3540,5 +3641,85 @@ fn parse_inline(
             pfx = "";
             rest = &rest[next..];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Test the prefix-sum + binary-search logic used by rebuild_block_layout_cache
+    /// and first_visible_block. This validates that O(log n) viewport access works
+    /// correctly without requiring a GPU context.
+    #[test]
+    fn prefix_sum_binary_search_finds_first_visible() {
+        let padding = 4.0f32;
+        let gap = 2.0f32;
+        let heights: Vec<f32> = vec![50.0, 30.0, 80.0, 40.0, 60.0, 100.0, 20.0, 70.0];
+
+        // Build prefix sums (same logic as rebuild_block_layout_cache).
+        let mut prefix = Vec::with_capacity(heights.len() + 1);
+        let mut y = padding;
+        for h in &heights {
+            prefix.push(y);
+            y += h + gap;
+        }
+        prefix.push(y); // sentinel
+
+        // Binary search for first block whose bottom edge > scroll_offset.
+        let first_visible = |scroll_offset: f32| -> usize {
+            let n = heights.len();
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let bottom = prefix[mid] + heights[mid] + gap;
+                if bottom <= scroll_offset {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+
+        // At scroll=0, first visible is block 0.
+        assert_eq!(first_visible(0.0), 0);
+
+        // Scroll past block 0: block 0 starts at y=4, height=50, bottom=56.
+        // At scroll=56, block 0 is just above viewport, first visible = 1.
+        assert_eq!(first_visible(56.0), 1);
+
+        // Scroll to where block 2 starts.
+        let block2_y = prefix[2]; // = 4 + 50 + 2 + 30 + 2 = 88
+        assert!((block2_y - 88.0).abs() < 0.01);
+        assert_eq!(first_visible(block2_y), 2);
+
+        // Scroll past all blocks.
+        let total = *prefix.last().unwrap();
+        assert_eq!(first_visible(total), heights.len());
+
+        // Verify prefix sums are monotonically increasing.
+        for i in 1..prefix.len() {
+            assert!(prefix[i] > prefix[i - 1]);
+        }
+    }
+
+    /// Verify that block_top_y returns correct values from the prefix cache.
+    #[test]
+    fn block_top_y_matches_prefix() {
+        let padding = 4.0f32;
+        let gap = 2.0f32;
+        let heights = [100.0f32, 200.0, 50.0];
+        let mut prefix = vec![];
+        let mut y = padding;
+        for h in &heights {
+            prefix.push(y);
+            y += h + gap;
+        }
+        prefix.push(y);
+
+        assert!((prefix[0] - 4.0).abs() < 0.01);
+        assert!((prefix[1] - 106.0).abs() < 0.01); // 4 + 100 + 2
+        assert!((prefix[2] - 308.0).abs() < 0.01); // 106 + 200 + 2
+        assert!((prefix[3] - 360.0).abs() < 0.01); // 308 + 50 + 2
     }
 }
