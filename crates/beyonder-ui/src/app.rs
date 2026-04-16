@@ -42,6 +42,91 @@ fn startup_cwd() -> PathBuf {
     cwd.unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Resolve a file:// URL (or plain absolute path) to a local path.
+/// Returns None for URLs with a non-local host, or non-file schemes.
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let raw = if let Some(rest) = url.strip_prefix("file://") {
+        // Strip optional "localhost" host.
+        rest.strip_prefix("localhost").unwrap_or(rest)
+    } else if url.starts_with('/') {
+        url
+    } else {
+        return None;
+    };
+    // Drop a query/fragment suffix.
+    let raw = raw.split(['?', '#']).next().unwrap_or(raw);
+    // Percent-decode.
+    let mut out = Vec::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    Some(PathBuf::from(decoded))
+}
+
+/// Shell-quote a path for safe interpolation into a command string.
+fn shell_quote(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    // Single-quote wrap; replace any single quote with '"'"'
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Find an editor binary to use when the user clicks a file link.
+/// Preference: $VISUAL, $EDITOR, nvim, vim, nano.
+fn find_editor() -> Option<String> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    for candidate in ["nvim", "vim", "nano"] {
+        if binary_in_path(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// True iff `name` is an executable file in one of the directories on $PATH.
+fn binary_in_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    for dir in path.split(':') {
+        let candidate = std::path::Path::new(dir).join(name);
+        if let Ok(md) = std::fs::metadata(&candidate) {
+            if md.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if md.permissions().mode() & 0o111 != 0 {
+                        return true;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn current_conda_env() -> String {
     std::env::var("CONDA_DEFAULT_ENV").unwrap_or_else(|_| "—".to_string())
 }
@@ -844,6 +929,37 @@ impl App {
         self.broadcast_tab_list();
     }
 
+    /// Open `path` in $VISUAL/$EDITOR (or nvim/vim/nano) inside a fresh tab.
+    /// If no editor is installed, surfaces an install hint instead of silently failing.
+    pub fn open_file_in_editor(&mut self, path: PathBuf) {
+        let Some(editor) = find_editor() else {
+            self.push_text_block(
+                "No editor found. Install nvim (recommended) or set $EDITOR to open files on click."
+                    .to_string(),
+            );
+            return;
+        };
+        self.new_tab();
+        // Rename the tab to the file's basename for clarity.
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}", self.active_tab + 1));
+        if let Some(slot) = self.tab_titles.get_mut(self.active_tab) {
+            *slot = title;
+        }
+        // Write the editor invocation to the new PTY. The shell will read it
+        // once it finishes sourcing rc files and prints its prompt.
+        let cmd = format!("{} {}\n", editor, shell_quote(&path));
+        if let Some(pty) = &mut self.pty {
+            if let Err(e) = pty.write(cmd.as_bytes()) {
+                error!("Failed to write editor command to PTY: {e}");
+            }
+        }
+        self.broadcast_tab_list();
+    }
+
     /// Close the active tab. Falls back to adjacent tab; if it was the last tab,
     /// opens a fresh one so the app is never tab-less.
     pub fn close_tab(&mut self) {
@@ -1339,13 +1455,26 @@ impl App {
     }
 
     fn handle_click(&mut self, pos: (f32, f32)) {
-        // OSC 8 hyperlink click — open in default browser.
-        for (rect, url) in &self.renderer.link_rects {
+        // OSC 8 hyperlink click.
+        // file:// or bare absolute-path links open in an editor tab; everything
+        // else (http, https, mailto, ...) hands off to the system handler.
+        let hit_url = self.renderer.link_rects.iter().find_map(|(rect, url)| {
             let [rx, ry, rw, rh] = *rect;
             if pos.0 >= rx && pos.0 < rx + rw && pos.1 >= ry && pos.1 < ry + rh {
-                let _ = open::that(url);
-                return;
+                Some(url.clone())
+            } else {
+                None
             }
+        });
+        if let Some(url) = hit_url {
+            if let Some(path) = file_url_to_path(&url) {
+                if path.is_file() {
+                    self.open_file_in_editor(path);
+                    return;
+                }
+            }
+            let _ = open::that(&url);
+            return;
         }
         // Tab strip click — switch to clicked tab.
         if let Some(tab_idx) = self.renderer.tab_hit(pos.0, pos.1) {

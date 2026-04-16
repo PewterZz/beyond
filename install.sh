@@ -92,6 +92,10 @@ main() {
     echo ""
     echo "  Make sure you have a GPU that supports wgpu (Metal/Vulkan/DX12)"
     echo "  and at least one LLM provider running for agent features."
+    echo ""
+    echo "  Recommended:"
+    echo "    - nvim (or vim / nano) — opened when you click a file link"
+    echo "      in the block stream. Respects \$VISUAL / \$EDITOR."
 }
 
 main "$@"
