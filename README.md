@@ -40,11 +40,10 @@ VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/PewterZz/Beyond/main/
 cargo install beyondtty
 ```
 
-### Homebrew
+### Homebrew (macOS / Linux)
 
 ```bash
-brew tap PewterZz/tap
-brew install beyondtty
+brew install PewterZz/tap/beyondtty
 ```
 
 ### Build from source
