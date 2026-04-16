@@ -22,3 +22,10 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "protocol_bench"
+harness = false
