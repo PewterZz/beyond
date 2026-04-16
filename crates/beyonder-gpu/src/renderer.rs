@@ -56,6 +56,14 @@ pub enum TextSelection {
         anchor: TextCursor,
         cursor: TextCursor,
     },
+    /// Cell-grid selection over the live TUI grid (claude-code, nvim, etc.).
+    /// Activated when the user holds the selection-override modifier and drags.
+    Tui {
+        /// (row, col) at mouse-down.
+        anchor: (usize, usize),
+        /// (row, col) at last drag point.
+        cursor: (usize, usize),
+    },
 }
 
 #[inline]
@@ -794,6 +802,18 @@ impl Renderer {
     pub fn begin_text_selection(&mut self, phys_x: f32, phys_y: f32) -> bool {
         self.text_selection = None;
         self.selecting = false;
+        // TUI active: select on the live cell grid.
+        if self.tui_active {
+            if let Some(rc) = self.tui_cell_at(phys_x, phys_y) {
+                self.text_selection = Some(TextSelection::Tui {
+                    anchor: rc,
+                    cursor: rc,
+                });
+                self.selecting = true;
+                return true;
+            }
+            return false;
+        }
         let Some((idx, _)) = self.block_hit_at(phys_y) else {
             return false;
         };
@@ -864,6 +884,11 @@ impl Renderer {
                         anchor,
                         cursor: cur,
                     });
+                }
+            }
+            TextSelection::Tui { anchor, .. } => {
+                if let Some(rc) = self.tui_cell_at(phys_x, phys_y) {
+                    self.text_selection = Some(TextSelection::Tui { anchor, cursor: rc });
                 }
             }
         }
@@ -954,6 +979,7 @@ impl Renderer {
             Some(TextSelection::Buffer { anchor, cursor, .. }) => {
                 (anchor.line, anchor.index) != (cursor.line, cursor.index)
             }
+            Some(TextSelection::Tui { anchor, cursor }) => anchor != cursor,
             None => false,
         }
     }
@@ -1038,6 +1064,46 @@ impl Renderer {
                     None
                 } else {
                     Some(out)
+                }
+            }
+            Some(TextSelection::Tui { anchor, cursor }) => {
+                let (s, e) = order_rc(*anchor, *cursor);
+                if s == e {
+                    return None;
+                }
+                let row_max = self.tui_cells.len().saturating_sub(1);
+                let s_row = s.0.min(row_max);
+                let e_row = e.0.min(row_max);
+                let mut out = String::new();
+                for row_idx in s_row..=e_row {
+                    let row = &self.tui_cells[row_idx];
+                    let start_col = if row_idx == s_row { s.1 } else { 0 };
+                    let end_col = if row_idx == e_row {
+                        e.1.min(row.len())
+                    } else {
+                        row.len()
+                    };
+                    if end_col > start_col {
+                        for cell in &row[start_col..end_col] {
+                            out.push_str(cell.grapheme.as_str());
+                        }
+                    }
+                    if row_idx != e_row {
+                        out.push('\n');
+                    }
+                }
+                // Trim trailing spaces on each line — selecting past the last
+                // glyph in a row shouldn't drag whitespace padding into the
+                // clipboard.
+                let trimmed: String = out
+                    .lines()
+                    .map(|l| l.trim_end_matches([' ', '\t']).to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
                 }
             }
             None => None,
@@ -1263,6 +1329,29 @@ impl Renderer {
             return None;
         }
         Some((c as u32 + 1, r as u32 + 1))
+    }
+
+    /// Convert physical-pixel coords inside the TUI grid into a 0-based
+    /// (row, col) for selection tracking. Clamps to grid bounds so drags
+    /// past the edge still snap to the nearest cell.
+    pub fn tui_cell_at(&self, phys_x: f32, phys_y: f32) -> Option<(usize, usize)> {
+        if !self.tui_active {
+            return None;
+        }
+        let (cell_w, cell_h) = self.terminal_cell_size();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let pad = TUI_PAD * self.scale_factor;
+        let tab_h = self.tab_bar_height_phys();
+        let (cols, rows) = self.tui_grid_size();
+        let lx = (phys_x - pad).max(0.0);
+        let ly = (phys_y - pad - tab_h).max(0.0);
+        let c = (lx / cell_w).floor() as i64;
+        let r = (ly / cell_h).floor() as i64;
+        let c = c.clamp(0, cols as i64 - 1) as usize;
+        let r = r.clamp(0, rows as i64 - 1) as usize;
+        Some((r, c))
     }
 
     /// Terminal grid dimensions for TUI fullscreen mode (bar hidden — full window below tab strip).
@@ -2352,6 +2441,36 @@ impl Renderer {
                 _ => {
                     // Block (default).
                     rects.push(RectInstance::filled(cx0, cy0, cw_px, ch_px, cursor_color));
+                }
+            }
+        }
+
+        // Text-selection overlay (modifier-drag while in TUI mode).
+        if let Some(TextSelection::Tui { anchor, cursor }) = &self.text_selection {
+            let (s, e) = order_rc(*anchor, *cursor);
+            if s != e {
+                let tint = [0.40, 0.65, 1.0, 0.35];
+                let row_max = self.tui_cells.len().saturating_sub(1);
+                let s_row = s.0.min(row_max);
+                let e_row = e.0.min(row_max);
+                for row_idx in s_row..=e_row {
+                    let row = &self.tui_cells[row_idx];
+                    if row.is_empty() {
+                        continue;
+                    }
+                    let start_col = if row_idx == s_row { s.1 } else { 0 };
+                    let end_col = if row_idx == e_row {
+                        e.1.min(row.len())
+                    } else {
+                        row.len()
+                    };
+                    if end_col <= start_col {
+                        continue;
+                    }
+                    let rx = (pad + start_col as f32 * cell_w).floor();
+                    let ry = (top + row_idx as f32 * cell_h).floor();
+                    let rw = ((end_col - start_col) as f32 * cell_w).ceil();
+                    rects.push(RectInstance::filled(rx, ry, rw, cell_h.ceil(), tint));
                 }
             }
         }

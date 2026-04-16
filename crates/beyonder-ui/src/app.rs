@@ -42,19 +42,41 @@ fn startup_cwd() -> PathBuf {
     cwd.unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Resolve a file:// URL (or plain absolute path) to a local path.
-/// Returns None for URLs with a non-local host, or non-file schemes.
+/// Parse a clickable file-link target into a (possibly-relative) PathBuf.
+/// Accepts `file://[host]/abs/path`, bare `/abs/path`, `~/…`, and bare
+/// relative paths (`crates/foo/bar.rs`). Returns None only for things that
+/// clearly aren't file references (e.g. `http://…`, `mailto:…`).
 fn file_url_to_path(url: &str) -> Option<PathBuf> {
-    let raw = if let Some(rest) = url.strip_prefix("file://") {
-        // Strip optional "localhost" host.
-        rest.strip_prefix("localhost").unwrap_or(rest)
-    } else if url.starts_with('/') {
-        url
+    // Rule out non-file schemes early. Anything of the form `scheme://` or
+    // `scheme:` where scheme isn't `file` belongs to the system handler.
+    if let Some(colon) = url.find(':') {
+        let scheme = &url[..colon];
+        let is_scheme =
+            !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+');
+        if is_scheme && scheme != "file" {
+            return None;
+        }
+    }
+
+    let raw: String = if let Some(rest) = url.strip_prefix("file://") {
+        // `file://host/path` — strip any host component up to the first '/'.
+        // `file:///path`  → host is empty, path starts right after.
+        // `file://localhost/path` → drop "localhost".
+        let after_host = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => return None,
+        };
+        after_host.to_string()
+    } else if let Some(rest) = url.strip_prefix('~') {
+        // Expand ~ / ~/path against $HOME.
+        let home = std::env::var("HOME").ok()?;
+        format!("{home}{rest}")
     } else {
-        return None;
+        url.to_string()
     };
+
     // Drop a query/fragment suffix.
-    let raw = raw.split(['?', '#']).next().unwrap_or(raw);
+    let raw = raw.split(['?', '#']).next().unwrap_or(&raw);
     // Percent-decode.
     let mut out = Vec::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -1227,14 +1249,18 @@ impl App {
                     }
                 }
                 // Extend an in-progress text selection while the left button is held.
+                // Active both outside TUI and inside TUI when the user holds
+                // the selection-override modifier (Option on macOS, Shift on
+                // Linux) to bypass mouse reporting — matches iTerm2/Alacritty.
+                let selection_override = self.selection_override_active();
                 if self.mouse_button_down == Some(winit::event::MouseButton::Left)
-                    && !self.renderer.tui_active
+                    && (!self.renderer.tui_active || selection_override)
                 {
                     self.renderer
                         .update_text_selection(self.cursor_pos.0, self.cursor_pos.1);
                 }
                 // SGR mouse motion / drag forwarding while a TUI is active.
-                if self.renderer.tui_active {
+                if self.renderer.tui_active && !selection_override {
                     let mr = self.term_grid.mouse_report_mode();
                     if mr.sgr && (mr.motion || (mr.drag && self.mouse_button_down.is_some())) {
                         if let Some((cx, cy)) = self
@@ -1258,8 +1284,11 @@ impl App {
                 if *state == ElementState::Pressed {
                     self.mouse_button_down = Some(*button);
                 }
-                // SGR mouse press/release forwarding.
-                if self.renderer.tui_active {
+                let selection_override = self.selection_override_active();
+                // SGR mouse press/release forwarding — skipped while the user
+                // holds the selection-override modifier so they can text-select
+                // and click-through links in claude-code / other TUIs.
+                if self.renderer.tui_active && !selection_override {
                     let mr = self.term_grid.mouse_report_mode();
                     if mr.sgr && mr.any() {
                         if let Some((cx, cy)) = self
@@ -1294,6 +1323,22 @@ impl App {
                     }
                 }
                 if *state == ElementState::Pressed && *button == winit::event::MouseButton::Left {
+                    // Modifier-held press in TUI mode: start a text-selection drag
+                    // immediately (no double-click required) so users can copy
+                    // from claude-code / nvim.
+                    if self.renderer.tui_active && selection_override {
+                        if self
+                            .renderer
+                            .begin_text_selection(self.cursor_pos.0, self.cursor_pos.1)
+                        {
+                            self.selected_block = None;
+                            self.selected_sub_output = false;
+                            self.renderer.selected_block = None;
+                            self.renderer.selected_sub_output = false;
+                        }
+                        self.last_lmb_press = None;
+                        return false;
+                    }
                     // Double-click detection: second LMB press within 400ms and 5px of the
                     // first begins a text-selection drag instead of a block click.
                     let now = std::time::Instant::now();
@@ -1416,8 +1461,44 @@ impl App {
                 }
                 false
             }
+            WindowEvent::DroppedFile(path) => {
+                // Drag-and-drop a file onto the window:
+                //   - TUI active (claude-code, nvim, etc.): bracketed-paste the
+                //     absolute path into the PTY. Claude Code accepts image paths
+                //     dropped this way; most editors just paste the text.
+                //   - Otherwise: insert the path into the input editor at the
+                //     cursor so the user can append more text or submit.
+                let mut text = path.to_string_lossy().to_string();
+                // Shell/agent inputs reach for the next token cleanly if the
+                // path ends with a space when followed by more input — but
+                // inserting a trailing space in the middle of a word would be
+                // wrong. Only append space when dropping into the input editor.
+                if self.renderer.tui_active {
+                    let seq = format!("\x1b[200~{text}\x1b[201~");
+                    self.write_to_pty(&seq);
+                } else {
+                    if !text.ends_with(' ') {
+                        text.push(' ');
+                    }
+                    self.input.insert_text(&text);
+                    self.renderer.snap_input_scroll_to_cursor();
+                }
+                false
+            }
             WindowEvent::CloseRequested => true,
             _ => false,
+        }
+    }
+
+    /// True while the user is holding a modifier that should override the
+    /// active TUI's mouse reporting — so they can drag-select text and
+    /// click-through to links while e.g. claude-code is running. Matches
+    /// iTerm2 / Alacritty convention: Option on macOS, Shift on Linux.
+    fn selection_override_active(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.modifiers.alt_key() || self.modifiers.shift_key()
+        } else {
+            self.modifiers.shift_key()
         }
     }
 
@@ -1572,10 +1653,24 @@ impl App {
         });
         if let Some(url) = hit_url {
             if let Some(path) = file_url_to_path(&url) {
-                if path.is_file() {
-                    self.open_file_in_editor(path);
+                // Relative paths come from tools that emit OSC 8 links without
+                // absolute paths (git, many build tools). Resolve against the
+                // active tab's cwd, falling back to the process cwd.
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    let base = &self.block_builder.cwd;
+                    base.join(&path)
+                };
+                if resolved.is_file() {
+                    self.open_file_in_editor(resolved);
                     return;
                 }
+                tracing::warn!(
+                    path = %resolved.display(),
+                    url,
+                    "file link click: path not found"
+                );
             }
             let _ = open::that(&url);
             return;
