@@ -19,7 +19,11 @@ pub fn detect_tailscale_host() -> Option<String> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    if let Some(name) = v.get("Self").and_then(|s| s.get("DNSName")).and_then(|n| n.as_str()) {
+    if let Some(name) = v
+        .get("Self")
+        .and_then(|s| s.get("DNSName"))
+        .and_then(|n| n.as_str())
+    {
         let trimmed = name.trim_end_matches('.');
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
@@ -60,7 +64,12 @@ impl NgrokTunnel {
         }
 
         let mut cmd = Command::new("ngrok");
-        cmd.args(["http", &port.to_string(), "--log=stdout", "--log-format=json"]);
+        cmd.args([
+            "http",
+            &port.to_string(),
+            "--log=stdout",
+            "--log-format=json",
+        ]);
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         cmd.kill_on_drop(true);

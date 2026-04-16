@@ -263,25 +263,21 @@ impl AcpClient {
     /// On tool_use stop, emits ToolCallRequested events and TurnComplete, then returns.
     pub async fn prompt(&mut self, text: &str) -> Result<()> {
         self.start_prompt(text).await?;
-        loop {
-            match self.stream_until_pause().await? {
-                StreamPause::Done { stop_reason } => {
-                    let _ = self.event_tx.send(AgentEvent::TurnComplete { stop_reason });
-                    break;
-                }
-                StreamPause::ToolUse(tools) => {
-                    for tool in &tools {
-                        let _ = self.event_tx.send(AgentEvent::ToolCallRequested {
-                            id: tool.id.clone(),
-                            name: tool.name.clone(),
-                            input: tool.input.clone(),
-                        });
-                    }
-                    let _ = self.event_tx.send(AgentEvent::TurnComplete {
-                        stop_reason: "tool_use".to_string(),
+        match self.stream_until_pause().await? {
+            StreamPause::Done { stop_reason } => {
+                let _ = self.event_tx.send(AgentEvent::TurnComplete { stop_reason });
+            }
+            StreamPause::ToolUse(tools) => {
+                for tool in &tools {
+                    let _ = self.event_tx.send(AgentEvent::ToolCallRequested {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        input: tool.input.clone(),
                     });
-                    break;
                 }
+                let _ = self.event_tx.send(AgentEvent::TurnComplete {
+                    stop_reason: "tool_use".to_string(),
+                });
             }
         }
         Ok(())

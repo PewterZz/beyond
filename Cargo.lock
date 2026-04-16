@@ -206,6 +206,8 @@ dependencies = [
  "anyhow",
  "beyonder-config",
  "beyonder-ui",
+ "image",
+ "objc2 0.5.2",
  "tokio",
  "tracing",
  "tracing-subscriber",

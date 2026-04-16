@@ -2,6 +2,9 @@
 name = "beyonder-runtime"
 version.workspace = true
 edition.workspace = true
+description = "Agent supervisor and tool runtime for Beyond"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 beyonder-core = { workspace = true }

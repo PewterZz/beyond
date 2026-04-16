@@ -228,8 +228,18 @@ impl AgentSupervisor {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
         let sup_tx_driver = self.event_tx.clone();
         let aid_driver = agent_id.clone();
+        let wake_driver = self.wake.clone();
         tokio::spawn(async move {
-            agent_turn_task(aid_driver, backend, registry, cwd, cmd_rx, sup_tx_driver).await;
+            agent_turn_task(
+                aid_driver,
+                backend,
+                registry,
+                cwd,
+                cmd_rx,
+                sup_tx_driver,
+                wake_driver,
+            )
+            .await;
         });
 
         self.agents
@@ -253,6 +263,13 @@ impl AgentSupervisor {
     /// Reset conversation history for all active agents — called on /clear.
     pub fn reset_all_conversations(&self) {
         for handle in self.agents.values() {
+            let _ = handle.cmd_tx.send(AgentCmd::ResetConversation);
+        }
+    }
+
+    /// Reset conversation history for a single agent.
+    pub fn reset_conversation(&self, agent_id: &AgentId) {
+        if let Some(handle) = self.agents.get(agent_id) {
             let _ = handle.cmd_tx.send(AgentCmd::ResetConversation);
         }
     }
@@ -288,7 +305,17 @@ async fn agent_turn_task(
     cwd: PathBuf,
     mut cmd_rx: mpsc::UnboundedReceiver<AgentCmd>,
     sup_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    wake: Option<WakeFn>,
 ) {
+    // Helper: send a supervisor event and wake the UI event loop so it
+    // drains the channel promptly (even in ControlFlow::Wait mode).
+    let emit = |ev: SupervisorEvent| {
+        let _ = sup_tx.send(ev);
+        if let Some(ref w) = wake {
+            w();
+        }
+    };
+
     while let Some(cmd) = cmd_rx.recv().await {
         let prompt = match cmd {
             AgentCmd::ResetConversation => {
@@ -301,11 +328,11 @@ async fn agent_turn_task(
         info!(%agent_id, prompt_len = prompt.len(), "supervisor: starting turn");
         if let Err(e) = backend.start_turn(&prompt).await {
             warn!(%agent_id, "supervisor: start_turn error: {e}");
-            let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+            emit(SupervisorEvent::AgentEvent {
                 agent_id: agent_id.clone(),
                 event: AgentEvent::Error(e.to_string()),
             });
-            let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+            emit(SupervisorEvent::AgentEvent {
                 agent_id: agent_id.clone(),
                 event: AgentEvent::TurnComplete {
                     stop_reason: "error".into(),
@@ -319,11 +346,11 @@ async fn agent_turn_task(
             match backend.stream_until_pause().await {
                 Err(e) => {
                     warn!(%agent_id, "supervisor: stream_until_pause error: {e}");
-                    let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+                    emit(SupervisorEvent::AgentEvent {
                         agent_id: agent_id.clone(),
                         event: AgentEvent::Error(e.to_string()),
                     });
-                    let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+                    emit(SupervisorEvent::AgentEvent {
                         agent_id: agent_id.clone(),
                         event: AgentEvent::TurnComplete {
                             stop_reason: "error".into(),
@@ -333,7 +360,7 @@ async fn agent_turn_task(
                 }
                 Ok(StreamPause::Done { stop_reason }) => {
                     info!(%agent_id, %stop_reason, "supervisor: turn complete");
-                    let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+                    emit(SupervisorEvent::AgentEvent {
                         agent_id: agent_id.clone(),
                         event: AgentEvent::TurnComplete { stop_reason },
                     });
@@ -342,7 +369,7 @@ async fn agent_turn_task(
                 Ok(StreamPause::ToolUse(tools)) => {
                     // Notify the UI of each tool call.
                     for tool in &tools {
-                        let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+                        emit(SupervisorEvent::AgentEvent {
                             agent_id: agent_id.clone(),
                             event: AgentEvent::ToolCallRequested {
                                 id: tool.id.clone(),
@@ -357,7 +384,7 @@ async fn agent_turn_task(
                     for tool in tools {
                         let output =
                             run_tool(&registry, &tool.name, tool.input.clone(), cwd.clone()).await;
-                        let _ = sup_tx.send(SupervisorEvent::AgentEvent {
+                        emit(SupervisorEvent::AgentEvent {
                             agent_id: agent_id.clone(),
                             event: AgentEvent::ToolResult {
                                 id: tool.id.clone(),

@@ -1,6 +1,11 @@
 //! Single-line input editor with cursor and submission history.
 //! Handles keyboard events and produces text for routing by mode_detector.
 
+use std::path::PathBuf;
+
+/// Maximum number of history entries persisted to disk.
+const MAX_HISTORY: usize = 5000;
+
 #[derive(Debug, Clone, Default)]
 pub struct InputEditor {
     pub text: String,
@@ -224,7 +229,8 @@ impl InputEditor {
         }
     }
 
-    /// Push a submitted entry into history (dedup consecutive identical entries).
+    /// Push a submitted entry into history (dedup consecutive identical entries)
+    /// and append to the on-disk history file.
     pub fn push_history(&mut self, text: String) {
         if text.is_empty() {
             return;
@@ -232,7 +238,42 @@ impl InputEditor {
         if self.history.last().map(|s| s == &text).unwrap_or(false) {
             return;
         }
-        self.history.push(text);
+        self.history.push(text.clone());
+        // Append to disk — fire-and-forget, never block the UI.
+        Self::append_to_disk(&text);
+    }
+
+    /// Populate in-memory history from the on-disk file.
+    pub fn load_history_from_disk(&mut self) {
+        let path = Self::history_path();
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            self.history = contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
+            // Trim to last MAX_HISTORY entries if the file has grown.
+            if self.history.len() > MAX_HISTORY {
+                let excess = self.history.len() - MAX_HISTORY;
+                self.history.drain(..excess);
+            }
+        }
+    }
+
+    fn history_path() -> PathBuf {
+        beyonder_config::beyonder_dir().join("history")
+    }
+
+    fn append_to_disk(line: &str) {
+        use std::io::Write;
+        let path = Self::history_path();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{}", line);
+        }
     }
 
     /// Replace the editor content and move cursor to end.
@@ -276,5 +317,34 @@ impl InputEditor {
             i += 1;
         }
         i
+    }
+
+    /// Return the suffix of the best matching history entry, if any.
+    /// Searches from most recent to oldest for an entry that starts with
+    /// the current input text (case-sensitive prefix match).
+    pub fn ghost_suggestion(&self) -> Option<&str> {
+        let prefix = &self.text;
+        if prefix.is_empty() || self.history_idx.is_some() {
+            return None;
+        }
+        // Walk history backwards (most recent first).
+        for entry in self.history.iter().rev() {
+            if entry.len() > prefix.len() && entry.starts_with(prefix.as_str()) {
+                return Some(&entry[prefix.len()..]);
+            }
+        }
+        None
+    }
+
+    /// Accept the ghost suggestion: replace text with the full history entry.
+    /// Returns true if a suggestion was accepted.
+    pub fn accept_suggestion(&mut self) -> bool {
+        if let Some(suffix) = self.ghost_suggestion().map(String::from) {
+            self.text.push_str(&suffix);
+            self.cursor = self.text.len();
+            true
+        } else {
+            false
+        }
     }
 }

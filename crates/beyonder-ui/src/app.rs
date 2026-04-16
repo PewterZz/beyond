@@ -18,7 +18,7 @@ use beyonder_terminal::{BlockBuilder, PtySession, TermGrid};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -387,6 +387,9 @@ pub struct App {
     pub modifiers: ModifiersState,
     /// True while a shell command (or TUI) is running — input is forwarded to PTY.
     pub command_running: bool,
+    /// When the current shell command started running. Used to delay the "running…"
+    /// indicator so fast commands (ls, echo) don't flash it.
+    command_started_at: Option<std::time::Instant>,
     /// Previous TUI active state — used to detect transitions and resize PTY.
     prev_tui_active: bool,
     /// Sub-line accumulator for smooth mouse-wheel scrolling in TUI mode.
@@ -421,11 +424,20 @@ pub struct App {
     pub should_quit: bool,
     /// In Auto mode, if a shell command exits with code 127, route it to the agent instead.
     pending_agent_fallback: Option<String>,
+    /// True while the currently running shell command was sent from the phone.
+    /// Used to suppress the Auto-mode 127→agent fallback for remote commands.
+    last_cmd_from_remote: bool,
     /// Index into self.blocks up to which context has already been sent to the agent.
     /// Blocks at index >= this are "new" and will be included in the next agent prompt.
     agent_context_watermark: usize,
     /// Currently executing tool per agent: agent_id → tool_name.
     agent_running_tool: std::collections::HashMap<beyonder_core::AgentId, String>,
+    /// Which tab index owns each agent — avoids O(N) block scans to route events.
+    /// Updated on agent spawn and tab close.
+    agent_tab: std::collections::HashMap<beyonder_core::AgentId, usize>,
+    /// Set when self.blocks has been mutated and needs syncing to the renderer.
+    /// Cleared after the sync in render(). Avoids redundant full-vec clones.
+    blocks_dirty: bool,
     /// Throttle for blocking env-probe subprocesses (node --version, conda env list).
     /// Only re-run them if this much time has elapsed since the last probe.
     last_env_probe: std::time::Instant,
@@ -600,9 +612,12 @@ impl App {
             }
         };
 
+        let mut input = InputEditor::new();
+        input.load_history_from_disk();
+
         Ok(Self {
             renderer,
-            input: InputEditor::new(),
+            input,
             config,
             store,
             session,
@@ -619,6 +634,7 @@ impl App {
             cursor_pos: (0.0, 0.0),
             modifiers: ModifiersState::empty(),
             command_running: false,
+            command_started_at: None,
             prev_tui_active: false,
             scroll_accum: 0.0,
             mouse_button_down: None,
@@ -636,8 +652,11 @@ impl App {
             completion_cycle: None,
             should_quit: false,
             pending_agent_fallback: None,
+            last_cmd_from_remote: false,
             agent_context_watermark: 0,
             agent_running_tool: std::collections::HashMap::new(),
+            agent_tab: std::collections::HashMap::new(),
+            blocks_dirty: false,
             // Use a past instant so the first post-command probe runs after startup.
             last_env_probe: std::time::Instant::now() - std::time::Duration::from_secs(60),
             tabs: vec![None],
@@ -712,11 +731,13 @@ impl App {
             let _ = pty.resize(rows, cols);
         }
         self.renderer.blocks = self.blocks.clone();
+        self.renderer.invalidate_block_caches();
         self.renderer.selected_block = self.selected_block;
         self.renderer.selected_sub_output = self.selected_sub_output;
         self.renderer.agent_running_tool = self.agent_running_tool.clone();
         self.renderer.running_block_idx = None;
         self.renderer.tui_cells = vec![];
+        self.renderer.input_text = self.input.text.clone();
         self.renderer.viewport.scroll_to_bottom();
         self.renderer.snap_input_scroll_to_cursor();
     }
@@ -759,13 +780,16 @@ impl App {
             }
         };
 
+        let mut input = InputEditor::new();
+        input.load_history_from_disk();
+
         TabState {
             session,
             pty,
             block_builder,
             term_grid,
             blocks: vec![],
-            input: InputEditor::new(),
+            input,
             agent_context_watermark: 0,
             agent_running_tool: std::collections::HashMap::new(),
             pending_agent_fallback: None,
@@ -790,6 +814,7 @@ impl App {
         self.tab_titles.push(title);
         self.active_tab = next_idx;
         self.remote_cursor = 0;
+        self.remote_prev_cells.clear();
         self.resync_renderer_after_tab_switch();
         self.broadcast_tab_list();
     }
@@ -820,7 +845,15 @@ impl App {
         } else {
             target_idx
         };
+        // Update agent_tab: remove agents on the closed tab, shift indices above it.
+        self.agent_tab.retain(|_, tab| *tab != removed);
+        for tab in self.agent_tab.values_mut() {
+            if *tab > removed {
+                *tab -= 1;
+            }
+        }
         self.remote_cursor = 0;
+        self.remote_prev_cells.clear();
         self.resync_renderer_after_tab_switch();
         self.broadcast_tab_list();
     }
@@ -842,6 +875,7 @@ impl App {
         self.active_tab = idx;
         self.tabs[prev] = Some(displaced);
         self.remote_cursor = 0;
+        self.remote_prev_cells.clear();
         self.resync_renderer_after_tab_switch();
         self.broadcast_tab_list();
     }
@@ -1337,6 +1371,12 @@ impl App {
             self.renderer.open_dropdown = None;
             return;
         }
+        // Ensure renderer blocks are in sync before hit-testing (the dirty flag
+        // defers the clone to render(), but click needs consistent indices now).
+        if self.blocks_dirty {
+            self.blocks_dirty = false;
+            self.renderer.blocks = self.blocks.clone();
+        }
         if let Some((idx, _)) = self.renderer.block_hit_at(pos.1) {
             // Clicking a ToolCall output block toggles it open/closed.
             if let Some(block) = self.blocks.get(idx) {
@@ -1764,7 +1804,14 @@ impl App {
                 self.input.history_next();
             }
             Key::Named(NamedKey::ArrowLeft) => self.input.move_left(),
-            Key::Named(NamedKey::ArrowRight) => self.input.move_right(),
+            Key::Named(NamedKey::ArrowRight) => {
+                // At end of input with a ghost suggestion → accept it.
+                if self.input.cursor == self.input.text.len() && self.input.accept_suggestion() {
+                    // accepted
+                } else {
+                    self.input.move_right();
+                }
+            }
             Key::Named(NamedKey::Home) => self.input.move_home(),
             Key::Named(NamedKey::End) => self.input.move_end(),
             Key::Named(NamedKey::Space) => {
@@ -2207,6 +2254,15 @@ impl App {
     }
 
     async fn send_to_shell(&mut self, text: String) {
+        self.send_to_shell_inner(text, false).await;
+    }
+
+    async fn send_to_shell_remote(&mut self, text: String) {
+        self.send_to_shell_inner(text, true).await;
+    }
+
+    async fn send_to_shell_inner(&mut self, text: String, from_remote: bool) {
+        self.last_cmd_from_remote = from_remote;
         let mut cmd = text;
         cmd.push('\n');
         if let Some(pty) = &mut self.pty {
@@ -2240,6 +2296,7 @@ impl App {
         let existing_id = agents.iter().find(|a| a.name == name).map(|a| a.id.clone());
 
         if let Some(agent_id) = existing_id {
+            self.agent_tab.insert(agent_id.clone(), self.active_tab);
             self.push_pending_agent_block(agent_id.clone());
             if let Err(e) = self.supervisor.prompt_agent(&agent_id, &full_prompt) {
                 error!("Failed to prompt agent {name}: {e}");
@@ -2289,6 +2346,7 @@ impl App {
                         agent_id.clone(),
                         CapabilitySet::default_coding_agent(self.session.working_directory.clone()),
                     );
+                    self.agent_tab.insert(agent_id.clone(), self.active_tab);
                     self.push_pending_agent_block(agent_id.clone());
                     if let Err(e) = self.supervisor.prompt_agent(&agent_id, &full_prompt) {
                         error!("Failed to prompt new agent: {e}");
@@ -2309,8 +2367,26 @@ impl App {
                 self.blocks.clear();
                 self.renderer.blocks.clear();
                 self.renderer.running_block_idx = None;
+                self.renderer.tui_cells = vec![];
+                self.renderer.selected_block = None;
+                self.renderer.invalidate_block_caches();
+                self.selected_block = None;
+                self.renderer.viewport.scroll_offset = 0.0;
+                self.renderer.viewport.pinned_to_bottom = true;
                 self.agent_context_watermark = 0;
-                self.supervisor.reset_all_conversations();
+                self.agent_running_tool.clear();
+                // Only reset agents that belong to this tab.
+                let current_tab = self.active_tab;
+                let tab_agents: Vec<_> = self
+                    .agent_tab
+                    .iter()
+                    .filter(|(_, tab)| **tab == current_tab)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &tab_agents {
+                    self.supervisor.reset_conversation(id);
+                }
+                self.blocks_dirty = true;
                 info!("Block stream cleared");
             }
             ["/help"] => {
@@ -2584,7 +2660,7 @@ impl App {
             provenance: ProvenanceChain::default(),
         };
         self.blocks.push(block.clone());
-        self.renderer.blocks.push(block);
+        self.blocks_dirty = true;
         self.renderer.viewport.scroll_to_bottom();
     }
 
@@ -2611,7 +2687,7 @@ impl App {
         };
         // No DB write — Running blocks are ephemeral; persisted on completion.
         self.blocks.push(block.clone());
-        self.renderer.blocks = self.blocks.clone();
+        self.blocks_dirty = true;
         self.renderer.scroll_to_bottom();
     }
 
@@ -2672,7 +2748,7 @@ impl App {
             provenance: ProvenanceChain::default(),
         };
         self.blocks.push(block.clone());
-        self.renderer.blocks.push(block);
+        self.blocks_dirty = true;
         self.renderer.set_qr_block(
             id,
             beyonder_gpu::renderer::QrBitmap {
@@ -2701,7 +2777,7 @@ impl App {
             provenance: ProvenanceChain::default(),
         };
         self.blocks.push(block.clone());
-        self.renderer.blocks.push(block);
+        self.blocks_dirty = true;
         if self.renderer.viewport.pinned_to_bottom {
             self.renderer.viewport.scroll_to_bottom();
         }
@@ -2791,6 +2867,9 @@ impl App {
         let tui_now = self.term_grid.tui_active() || interactive_cli;
         if tui_now != self.prev_tui_active {
             self.prev_tui_active = tui_now;
+            // Force full frame on next remote tick — the alt-screen buffer is a
+            // completely different surface so the old diff baseline is invalid.
+            self.remote_prev_cells.clear();
             let (cols, rows) = if tui_now {
                 self.renderer.tui_grid_size()
             } else {
@@ -2802,52 +2881,33 @@ impl App {
             }
         }
 
-        // Drain supervisor events. Batch renderer sync to once after the loop.
+        // Drain supervisor events. Route each event to the tab that owns the
+        // agent via the agent_tab map (O(1) lookup instead of scanning blocks).
         let mut agent_events_received = false;
         while let Ok(event) = self.supervisor_rx.try_recv() {
             match event {
                 SupervisorEvent::AgentEvent { agent_id, event } => {
                     agent_events_received = true;
-                    match event {
-                        AgentEvent::TextDelta(text) => {
-                            // New text means the tool (if any) has completed.
-                            self.agent_running_tool.remove(&agent_id);
-                            self.append_agent_text(&agent_id, &text);
-                        }
-                        AgentEvent::ToolCallRequested { id, name, input } => {
-                            info!(tool = %name, "Agent tool call requested");
-                            self.agent_running_tool
-                                .insert(agent_id.clone(), name.clone());
-                            // Finalize any in-flight agent text block (empty → removed).
-                            self.finalize_agent_block(&agent_id);
-                            // Show the tool call immediately so the user sees what's running.
-                            self.push_tool_call_block(&agent_id, id, name, input);
-                        }
-                        AgentEvent::ToolResult {
-                            id,
-                            name: _,
-                            output,
-                            is_error,
-                        } => {
-                            self.complete_tool_call_block(&id, output, is_error);
-                            // Push a new empty Running agent block so the spinner stays
-                            // visible while we wait for the LLM to resume. The tool name
-                            // in agent_running_tool (not cleared here) keeps the label
-                            // showing. finalize_agent_block will drop this block if it's
-                            // still empty when the next ToolCallRequested fires.
-                            self.push_pending_agent_block(agent_id.clone());
-                        }
-                        AgentEvent::TurnComplete { ref stop_reason } => {
-                            info!(%agent_id, %stop_reason, "ui: TurnComplete received");
-                            self.agent_running_tool.remove(&agent_id);
-                            debug!(%agent_id, "ui: calling finalize_agent_block");
-                            self.finalize_agent_block(&agent_id);
-                            debug!(%agent_id, "ui: finalize_agent_block done");
-                        }
-                        AgentEvent::Error(e) => {
-                            error!(%agent_id, "ui: agent error: {e}");
+
+                    let owner_tab = self.agent_tab.get(&agent_id).copied();
+                    let stashed_idx = match owner_tab {
+                        Some(tab) if tab != self.active_tab => Some(tab),
+                        None => None, // unknown agent — apply to active tab
+                        _ => None,    // active tab owns it
+                    };
+
+                    // If the agent lives on a stashed tab, swap it in temporarily.
+                    if let Some(si) = stashed_idx {
+                        if let Some(stashed) = self.tabs[si].take() {
+                            let displaced = self.exchange_active(stashed);
+                            self.apply_agent_event(&agent_id, event);
+                            let updated = self.exchange_active(displaced);
+                            self.tabs[si] = Some(updated);
+                            continue;
                         }
                     }
+
+                    self.apply_agent_event(&agent_id, event);
                 }
                 SupervisorEvent::AgentSpawned(info) => {
                     info!(name = %info.name, "Agent spawned");
@@ -2857,7 +2917,7 @@ impl App {
         }
         if agent_events_received {
             had_work = true;
-            self.renderer.blocks = self.blocks.clone();
+            self.blocks_dirty = true;
             self.renderer.agent_running_tool = self.agent_running_tool.clone();
         }
 
@@ -3058,7 +3118,7 @@ impl App {
             if cmd.starts_with('/') {
                 self.handle_command(&cmd).await;
             } else {
-                self.send_to_shell(cmd).await;
+                self.send_to_shell_remote(cmd).await;
             }
         }
         // Phone-side Prompt messages are ignored — the agent runs on the
@@ -3108,11 +3168,24 @@ impl App {
                         self.renderer.blocks.clear();
                         self.renderer.tui_cells = vec![];
                         self.renderer.selected_block = None;
+                        self.renderer.invalidate_block_caches();
                         self.selected_block = None;
                         self.renderer.viewport.scroll_offset = 0.0;
                         self.renderer.viewport.pinned_to_bottom = true;
                         self.agent_context_watermark = 0;
-                        self.supervisor.reset_all_conversations();
+                        self.agent_running_tool.clear();
+                        // Only reset agents that belong to this tab.
+                        let current_tab = self.active_tab;
+                        let tab_agents: Vec<_> = self
+                            .agent_tab
+                            .iter()
+                            .filter(|(_, tab)| **tab == current_tab)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for id in &tab_agents {
+                            self.supervisor.reset_conversation(id);
+                        }
+                        self.blocks_dirty = true;
                         return;
                     }
                 }
@@ -3124,7 +3197,8 @@ impl App {
 
                 // Auto mode: exit 127 ("command not found") → silently reroute to agent.
                 // Remove the block so no error appears, then queue the input as an agent prompt.
-                if self.app_mode == AppMode::Auto {
+                // Skip this for commands sent from the phone — those are always shell-only.
+                if self.app_mode == AppMode::Auto && !self.last_cmd_from_remote {
                     if let BlockContent::ShellCommand {
                         ref input,
                         exit_code: Some(127),
@@ -3136,19 +3210,20 @@ impl App {
                         // separate preceding human-prompt block, so removing more would
                         // silently delete the previous command's block.
                         self.blocks.retain(|b| b.id != block_id);
-                        self.renderer.blocks = self.blocks.clone();
+                        self.blocks_dirty = true;
                         self.renderer.tui_cells = vec![];
                         self.pending_agent_fallback = Some(cmd);
                         return;
                     }
                 }
+                self.last_cmd_from_remote = false;
 
                 if let Some(b) = self.blocks.iter_mut().find(|b| b.id == block_id) {
                     b.content = content;
                     b.status = BlockStatus::Completed;
                     let _ = BlockStore::new(&self.store).update(b);
                 }
-                self.renderer.blocks = self.blocks.clone();
+                self.blocks_dirty = true;
                 // Clear live cells — the command is done.
                 self.renderer.tui_cells = vec![];
                 // Refresh pill labels — user may have run conda activate / nvm use.
@@ -3167,17 +3242,66 @@ impl App {
         // Persist to DB.
         let _ = BlockStore::new(&self.store).insert(&block);
         self.blocks.push(block);
-        self.renderer.blocks = self.blocks.clone();
+        self.blocks_dirty = true;
         if self.renderer.viewport.pinned_to_bottom {
             self.renderer.scroll_to_bottom();
         }
     }
 
+    fn apply_agent_event(&mut self, agent_id: &beyonder_core::AgentId, event: AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(text) => {
+                self.agent_running_tool.remove(agent_id);
+                self.append_agent_text(agent_id, &text);
+            }
+            AgentEvent::ToolCallRequested { id, name, input } => {
+                info!(tool = %name, "Agent tool call requested");
+                self.agent_running_tool
+                    .insert(agent_id.clone(), name.clone());
+                self.finalize_agent_block(agent_id);
+                self.push_tool_call_block(agent_id, id, name, input);
+            }
+            AgentEvent::ToolResult {
+                id,
+                name: _,
+                output,
+                is_error,
+            } => {
+                self.complete_tool_call_block(&id, output, is_error);
+                self.push_pending_agent_block(agent_id.clone());
+            }
+            AgentEvent::TurnComplete { ref stop_reason } => {
+                info!(%agent_id, %stop_reason, "ui: TurnComplete received");
+                self.agent_running_tool.remove(agent_id);
+                self.finalize_agent_block(agent_id);
+            }
+            AgentEvent::Error(e) => {
+                error!(%agent_id, "ui: agent error: {e}");
+            }
+        }
+    }
+
     fn append_agent_text(&mut self, agent_id: &beyonder_core::AgentId, text: &str) {
         // Find the most recent Running agent block for this agent_id.
-        let idx = self.blocks.iter().rposition(|b| {
-            b.agent_id.as_ref() == Some(agent_id) && matches!(b.status, BlockStatus::Running)
-        });
+        // Fast path: the running block is almost always the last one.
+        let idx = {
+            let n = self.blocks.len();
+            if n > 0 {
+                let last = &self.blocks[n - 1];
+                if last.agent_id.as_ref() == Some(agent_id)
+                    && matches!(last.status, BlockStatus::Running)
+                {
+                    Some(n - 1)
+                } else {
+                    self.blocks.iter().rposition(|b| {
+                        b.agent_id.as_ref() == Some(agent_id)
+                            && matches!(b.status, BlockStatus::Running)
+                    })
+                }
+            } else {
+                None
+            }
+        };
 
         if let Some(idx) = idx {
             let block = &mut self.blocks[idx];
@@ -3211,12 +3335,32 @@ impl App {
     }
 
     fn finalize_agent_block(&mut self, agent_id: &beyonder_core::AgentId) {
-        if let Some(idx) = self.blocks.iter().rposition(|b| {
-            b.agent_id.as_ref() == Some(agent_id) && matches!(b.status, BlockStatus::Running)
-        }) {
+        let found = {
+            let n = self.blocks.len();
+            if n > 0 {
+                let last = &self.blocks[n - 1];
+                if last.agent_id.as_ref() == Some(agent_id)
+                    && matches!(last.status, BlockStatus::Running)
+                {
+                    Some(n - 1)
+                } else {
+                    self.blocks.iter().rposition(|b| {
+                        b.agent_id.as_ref() == Some(agent_id)
+                            && matches!(b.status, BlockStatus::Running)
+                    })
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(idx) = found {
             let is_empty = match &self.blocks[idx].content {
                 beyonder_core::BlockContent::AgentMessage { content_blocks, .. } => {
                     content_blocks.is_empty()
+                        || content_blocks.iter().all(|cb| match cb {
+                            beyonder_core::ContentBlock::Text { text } => text.trim().is_empty(),
+                            _ => false,
+                        })
                 }
                 _ => false,
             };
@@ -3228,7 +3372,7 @@ impl App {
                 // DB write deferred — avoid blocking the main thread with fsync.
             }
         }
-        self.renderer.blocks = self.blocks.clone();
+        self.blocks_dirty = true;
     }
 
     fn push_tool_call_block(
@@ -3281,6 +3425,8 @@ impl App {
             {
                 if is_error {
                     *error = Some(output);
+                } else if output.trim().is_empty() {
+                    *out = Some("Success".to_string());
                 } else {
                     *out = Some(output);
                 }
@@ -3289,9 +3435,44 @@ impl App {
         }
     }
 
+    /// Returns true when there's a running block whose spinner needs continuous redraws.
+    pub fn needs_animation(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| matches!(b.status, beyonder_core::BlockStatus::Running))
+    }
+
+    /// Returns true when any tab (active or stashed) has a running block, meaning
+    /// async agent/tool work is in-flight and supervisor events may arrive.
+    pub fn has_pending_async_work(&self) -> bool {
+        if self.needs_animation() {
+            return true;
+        }
+        self.tabs.iter().any(|t| {
+            t.as_ref().map_or(false, |ts| {
+                ts.blocks
+                    .iter()
+                    .any(|b| matches!(b.status, beyonder_core::BlockStatus::Running))
+            })
+        })
+    }
+
     pub fn render(&mut self) -> Result<()> {
-        self.command_running =
-            self.block_builder.is_running_command() || self.term_grid.tui_active();
+        // Sync blocks to the renderer once per frame when dirty, instead of
+        // cloning the full vec on every individual mutation.
+        if self.blocks_dirty {
+            self.blocks_dirty = false;
+            self.renderer.blocks = self.blocks.clone();
+        }
+
+        let cmd_active = self.block_builder.is_running_command() || self.term_grid.tui_active();
+        if cmd_active && !self.command_running {
+            // Command just started — record the timestamp.
+            self.command_started_at = Some(std::time::Instant::now());
+        } else if !cmd_active {
+            self.command_started_at = None;
+        }
+        self.command_running = cmd_active;
 
         // Interactive CLIs that take over the terminal but don't use alt-screen
         // (e.g. `claude`) should hide the input bar just like nvim/htop do.
@@ -3319,6 +3500,7 @@ impl App {
         self.renderer.input_cursor = self.input.cursor;
         self.renderer.input_all_selected = self.input.all_selected;
         self.renderer.input_preedit = self.ime_preedit.clone();
+        self.renderer.input_ghost = self.input.ghost_suggestion().unwrap_or("").to_string();
         self.renderer.input_mode_prefix = if let Some(pat) = &self.search_pattern {
             let total = self.search_matches.len();
             let cur = self.search_current.map(|i| i + 1).unwrap_or(0);
@@ -3333,7 +3515,12 @@ impl App {
         };
         self.renderer.search_match_blocks = self.search_matches.clone();
         self.renderer.search_current_match = self.search_current;
-        self.renderer.input_running = self.block_builder.is_running_command();
+        // Only show "running…" for long-running commands (>500ms). Fast commands
+        // like `ls` finish before the threshold and never flash the indicator.
+        self.renderer.input_running = self.block_builder.is_running_command()
+            && self
+                .command_started_at
+                .map_or(false, |t| t.elapsed().as_millis() >= 500);
 
         // Command palette — filter commands by what's been typed after the leading /.
         self.renderer.command_palette =

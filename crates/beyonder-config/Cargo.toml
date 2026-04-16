@@ -2,6 +2,9 @@
 name = "beyonder-config"
 version.workspace = true
 edition.workspace = true
+description = "Configuration loader for the Beyond terminal"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 beyonder-core = { workspace = true }

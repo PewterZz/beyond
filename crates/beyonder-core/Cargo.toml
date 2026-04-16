@@ -2,6 +2,9 @@
 name = "beyonder-core"
 version.workspace = true
 edition.workspace = true
+description = "Core data model for the Beyond AI-native terminal"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }

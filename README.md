@@ -14,19 +14,52 @@ An AI-native terminal written in Rust. Beyond replaces the traditional scroll bu
 
 ## Requirements
 
-- Rust (stable, 2021 edition)
-- [`ollama`](https://ollama.com) running locally (`ollama serve`) — required for agent features
 - A GPU that supports `wgpu` (Metal on macOS, Vulkan/DX12 elsewhere)
+- [`ollama`](https://ollama.com) running locally (`ollama serve`) — required for agent features
 
-## Quick start
+## Installation
+
+### Quick install (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PewterZz/Beyond/main/install.sh | bash
+```
+
+Or specify a version:
+
+```bash
+VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/PewterZz/Beyond/main/install.sh | bash
+```
+
+### Cargo (from source)
+
+```bash
+cargo install beyonder
+```
+
+### Homebrew
+
+```bash
+brew tap PewterZz/tap
+brew install beyond
+```
+
+### Build from source
 
 ```bash
 git clone git@github.com:PewterZz/Beyond.git
 cd Beyond
-cargo run
+cargo build --release
+# Binary at target/release/beyonder
 ```
 
-The window opens at 1280×800. Type shell commands normally, or `/help` for slash commands. `/agent spawn <name>` to start an agent.
+## Quick start
+
+```bash
+beyonder
+```
+
+The window opens at 1280x800. Type shell commands normally, or `/help` for slash commands. `/agent spawn <name>` to start an agent.
 
 ## Common commands
 

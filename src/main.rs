@@ -7,7 +7,10 @@ use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Icon, Window, WindowAttributes, WindowId};
+
+/// Embedded app icon (256x256 PNG).
+static ICON_PNG: &[u8] = include_bytes!("../assets/beyond-macos.png");
 
 fn main() -> Result<()> {
     // Use RUST_LOG / BEYONDER_LOG as-is when set; fall back to sensible defaults.
@@ -23,6 +26,7 @@ fn main() -> Result<()> {
 
     info!("Beyond starting");
     let config = BeyonderConfig::load_or_default();
+
 
     let event_loop = EventLoop::<()>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -65,10 +69,14 @@ impl ApplicationHandler<()> for BeyonderHandler {
             return;
         }
 
-        let window_attrs = WindowAttributes::default()
+        let mut window_attrs = WindowAttributes::default()
             .with_title("Beyond")
             .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 800u32))
             .with_resizable(true);
+
+        if let Some(icon) = load_winit_icon() {
+            window_attrs = window_attrs.with_window_icon(Some(icon));
+        }
 
         let window = event_loop
             .create_window(window_attrs)
@@ -81,6 +89,10 @@ impl ApplicationHandler<()> for BeyonderHandler {
             .rt
             .block_on(App::new(Arc::clone(&window), config, proxy))
             .expect("Failed to init Beyond app");
+
+        // Set macOS Dock icon after NSApplication is initialized by winit.
+        #[cfg(target_os = "macos")]
+        set_macos_dock_icon();
 
         info!("Beyond initialized — window open");
         self.window = Some(Arc::clone(&window));
@@ -130,6 +142,13 @@ impl ApplicationHandler<()> for BeyonderHandler {
             }
         }
 
+        // When a spinner is animating (running agent/command block) we need
+        // continuous redraws even if tick() had no work this iteration.
+        let animating = self.app.as_ref().map_or(false, |app| app.needs_animation());
+        if animating {
+            self.needs_redraw = true;
+        }
+
         if self.needs_redraw {
             self.needs_redraw = false;
             if let Some(window) = &self.window {
@@ -141,9 +160,52 @@ impl ApplicationHandler<()> for BeyonderHandler {
             // gives us exact VSync alignment with zero manual timer overhead.
             event_loop.set_control_flow(ControlFlow::Poll);
         } else {
-            // Nothing changed — sleep until the next winit/user event or
-            // until an async source wakes us via EventLoopProxy.
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // No animation on the active tab. Use a short poll interval when
+            // any agent/tool work is in-flight (active or stashed tabs) to
+            // catch events promptly — macOS doesn't always deliver
+            // EventLoopProxy wakes from background threads reliably. When
+            // truly idle, use a longer interval.
+            let has_work = self
+                .app
+                .as_ref()
+                .map_or(false, |app| app.has_pending_async_work());
+            let timeout = if has_work { 16 } else { 500 };
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout),
+            ));
         }
+    }
+}
+
+/// Load the embedded icon as a winit Icon (for Linux/Windows taskbar).
+fn load_winit_icon() -> Option<Icon> {
+    let img = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png).ok()?;
+    let rgba = img.into_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
+/// Set the macOS Dock icon programmatically via NSApplication.
+/// `with_window_icon` only affects Linux/Windows; macOS ignores it for
+/// non-bundled apps and shows the default Terminal icon instead.
+#[cfg(target_os = "macos")]
+fn set_macos_dock_icon() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, msg_send_id};
+    use std::ffi::c_void;
+
+    unsafe {
+        let ptr = ICON_PNG.as_ptr() as *const c_void;
+        let len = ICON_PNG.len();
+        let data: Retained<AnyObject> =
+            msg_send_id![class!(NSData), dataWithBytes:ptr length:len];
+
+        let image: Retained<AnyObject> =
+            msg_send_id![msg_send_id![class!(NSImage), alloc], initWithData:&*data];
+
+        let app: Retained<AnyObject> =
+            msg_send_id![class!(NSApplication), sharedApplication];
+        let () = msg_send![&*app, setApplicationIconImage:&*image];
     }
 }

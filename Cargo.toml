@@ -17,12 +17,21 @@ resolver = "2"
 name = "beyonder"
 version.workspace = true
 edition.workspace = true
+description = "AI-native terminal with block-oriented model and GPU-accelerated rendering"
+homepage = "https://github.com/PewterZz/Beyond"
+repository = "https://github.com/PewterZz/Beyond"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+keywords = ["terminal", "ai", "gpu", "wgpu", "agent"]
+categories = ["command-line-utilities", "graphics"]
+exclude = ["assets/", "Formula/", "run*.log", ".claude/"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["Beyonder Contributors"]
 license = "GPL-3.0-or-later"
+repository = "https://github.com/PewterZz/Beyond"
 
 [workspace.dependencies]
 # Core
@@ -75,16 +84,19 @@ base64 = "0.22"
 # Open URLs in default browser (OSC 8 hyperlink clicks)
 open = "5"
 
+# Image decoding (app icon)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # Internal crates
-beyonder-core = { path = "crates/beyonder-core" }
-beyonder-store = { path = "crates/beyonder-store" }
-beyonder-terminal = { path = "crates/beyonder-terminal" }
-beyonder-acp = { path = "crates/beyonder-acp" }
-beyonder-runtime = { path = "crates/beyonder-runtime" }
-beyonder-gpu = { path = "crates/beyonder-gpu" }
-beyonder-ui = { path = "crates/beyonder-ui" }
-beyonder-config = { path = "crates/beyonder-config" }
-beyonder-remote = { path = "crates/beyonder-remote" }
+beyonder-core = { path = "crates/beyonder-core", version = "0.1.0" }
+beyonder-store = { path = "crates/beyonder-store", version = "0.1.0" }
+beyonder-terminal = { path = "crates/beyonder-terminal", version = "0.1.0" }
+beyonder-acp = { path = "crates/beyonder-acp", version = "0.1.0" }
+beyonder-runtime = { path = "crates/beyonder-runtime", version = "0.1.0" }
+beyonder-gpu = { path = "crates/beyonder-gpu", version = "0.1.0" }
+beyonder-ui = { path = "crates/beyonder-ui", version = "0.1.0" }
+beyonder-config = { path = "crates/beyonder-config", version = "0.1.0" }
+beyonder-remote = { path = "crates/beyonder-remote", version = "0.1.0" }
 
 [dependencies]
 beyonder-ui = { workspace = true }
@@ -94,6 +106,10 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+image = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
 
 [profile.dev]
 opt-level = 1

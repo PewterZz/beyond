@@ -376,28 +376,39 @@ fn parse_ansi_output(bytes: &[u8], cols: usize, rows: usize) -> TerminalOutput {
 
     let rows_out = trimmed
         .iter()
-        .map(|row| TerminalRow {
-            cells: row
-                .iter()
-                .map(|c| TerminalCell {
-                    grapheme: c.grapheme.clone(),
-                    fg: Some(Color {
-                        r: (c.fg[0] * 255.0) as u8,
-                        g: (c.fg[1] * 255.0) as u8,
-                        b: (c.fg[2] * 255.0) as u8,
-                    }),
-                    bg: c.bg.map(|bg| Color {
-                        r: (bg[0] * 255.0) as u8,
-                        g: (bg[1] * 255.0) as u8,
-                        b: (bg[2] * 255.0) as u8,
-                    }),
-                    bold: c.bold,
-                    italic: c.italic,
-                    underline: c.underline,
-                    strikethrough: c.strikethrough,
-                    link: c.link.as_ref().map(|a| a.as_ref().clone()),
-                })
-                .collect(),
+        .map(|row| {
+            // Trim trailing whitespace cells per row (same as the GPU renderer does).
+            let last_vis = row.iter().rposition(|c| {
+                let fc = c.first_char();
+                fc != ' ' && fc != '\0'
+            });
+            let end = match last_vis {
+                Some(i) => i + 1,
+                None => 0,
+            };
+            TerminalRow {
+                cells: row[..end]
+                    .iter()
+                    .map(|c| TerminalCell {
+                        grapheme: c.grapheme.clone(),
+                        fg: Some(Color {
+                            r: (c.fg[0] * 255.0) as u8,
+                            g: (c.fg[1] * 255.0) as u8,
+                            b: (c.fg[2] * 255.0) as u8,
+                        }),
+                        bg: c.bg.map(|bg| Color {
+                            r: (bg[0] * 255.0) as u8,
+                            g: (bg[1] * 255.0) as u8,
+                            b: (bg[2] * 255.0) as u8,
+                        }),
+                        bold: c.bold,
+                        italic: c.italic,
+                        underline: c.underline,
+                        strikethrough: c.strikethrough,
+                        link: c.link.as_ref().map(|a| a.as_ref().clone()),
+                    })
+                    .collect(),
+            }
         })
         .collect();
 

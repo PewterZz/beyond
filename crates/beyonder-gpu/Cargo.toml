@@ -2,6 +2,9 @@
 name = "beyonder-gpu"
 version.workspace = true
 edition.workspace = true
+description = "GPU-accelerated renderer for the Beyond terminal"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 beyonder-core = { workspace = true }

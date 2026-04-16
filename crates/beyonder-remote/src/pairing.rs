@@ -67,7 +67,11 @@ impl PairingSecret {
         let code = QrCode::with_error_correction_level(url.as_bytes(), EcLevel::M)
             .context("qr encode failed")?;
         let width = code.width();
-        let modules = code.to_colors().into_iter().map(|c| c == Color::Dark).collect();
+        let modules = code
+            .to_colors()
+            .into_iter()
+            .map(|c| c == Color::Dark)
+            .collect();
         Ok(QrBitmap { width, modules })
     }
 

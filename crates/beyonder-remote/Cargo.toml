@@ -2,6 +2,9 @@
 name = "beyonder-remote"
 version.workspace = true
 edition.workspace = true
+description = "Remote pairing and transport for the Beyond terminal"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 beyonder-core = { workspace = true }

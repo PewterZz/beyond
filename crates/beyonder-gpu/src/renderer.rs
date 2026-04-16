@@ -127,6 +127,8 @@ pub struct Renderer {
     /// Active IME preedit string (displayed at the caret in `self.theme.sky`
     /// with an underline until the input method commits). Synced from App.
     pub input_preedit: String,
+    /// Ghost suggestion suffix from history — rendered in muted color after the cursor.
+    pub input_ghost: String,
     /// Last known caret rect [x, y, w, h] in physical pixels — used by the host
     /// App to position the IME candidate window via `set_ime_cursor_area`.
     pub input_caret_rect: [f32; 4],
@@ -196,6 +198,10 @@ pub struct Renderer {
     // ── Block layout cache ──────────────────────────────────────────────────
     /// Cached per-block heights (parallel to `self.blocks`).
     block_heights: Vec<f32>,
+    /// Content fingerprint per block (status_byte, content_len). When this changes,
+    /// the block height must be recomputed — catches ToolCall Running→Completed and
+    /// agent text appends.
+    block_fingerprints: Vec<(u8, usize)>,
     /// Prefix-sum of (height + gap) — `block_y_prefix[i]` is the Y offset of block `i`.
     /// Length = blocks.len() + 1 (sentinel at end = total content height).
     block_y_prefix: Vec<f32>,
@@ -441,6 +447,7 @@ impl Renderer {
             input_all_selected: false,
             input_mode_prefix: "> ".to_string(),
             input_preedit: String::new(),
+            input_ghost: String::new(),
             input_caret_rect: [0.0; 4],
             computed_bar_h: INPUT_BAR_HEIGHT * scale_factor,
             input_scroll_px: 0.0,
@@ -471,6 +478,7 @@ impl Renderer {
             glyph_buf_cache: HashMap::new(),
             frame_counter: 0,
             block_heights: vec![],
+            block_fingerprints: vec![],
             block_y_prefix: vec![0.0],
             _blocks_generation: 0,
             layout_params_key: (0, 0, None),
@@ -606,13 +614,12 @@ impl Renderer {
                 }
             }
         }
-        for run in buf.layout_runs() {
+        if let Some(run) = buf.layout_runs().next() {
             if let Some(last) = run.glyphs.last() {
                 let total_w = last.x + last.w;
                 let n = run.glyphs.len() as f32;
                 cell_w = (total_w / n).round();
             }
-            break;
         }
 
         (cell_w, cell_h, metrics_line_h)
@@ -1518,6 +1525,9 @@ impl Renderer {
         } else {
             self.user_expanded.insert(block_id.clone());
         }
+        // Collapsed ↔ expanded changes block height — force layout rebuild.
+        self.layout_params_key = (0, 0, None);
+        self.glyph_buf_cache.remove(block_id);
     }
 
     /// Content-space Y (top) of block index `idx`, using the layout cache.
@@ -1543,6 +1553,45 @@ impl Renderer {
         }
     }
 
+    /// Invalidate all block-related caches. Must be called after replacing `self.blocks`
+    /// externally (e.g. tab switch) so the layout, glyph, and label caches rebuild from
+    /// the new block set.
+    pub fn invalidate_block_caches(&mut self) {
+        self.layout_params_key = (0, 0, None);
+        self.block_heights.clear();
+        self.block_fingerprints.clear();
+        self.block_y_prefix.clear();
+        self.glyph_buf_cache.clear();
+        self.header_label_cache.clear();
+        self.metadata_line_cache.clear();
+    }
+
+    /// Quick fingerprint of a block's content for cache invalidation.
+    fn block_fingerprint(block: &Block) -> (u8, usize) {
+        let status = match block.status {
+            beyonder_core::BlockStatus::Running => 1,
+            beyonder_core::BlockStatus::Completed => 2,
+            _ => 0,
+        };
+        let len = match &block.content {
+            BlockContent::AgentMessage { content_blocks, .. } => content_blocks
+                .iter()
+                .map(|cb| match cb {
+                    beyonder_core::ContentBlock::Text { text } => text.len(),
+                    beyonder_core::ContentBlock::Code { code, .. } => code.len(),
+                    beyonder_core::ContentBlock::Thinking { thinking } => thinking.len(),
+                })
+                .sum(),
+            BlockContent::ToolCall { output, error, .. } => {
+                output.as_ref().map_or(0, |s| s.len()) + error.as_ref().map_or(0, |s| s.len())
+            }
+            BlockContent::ShellCommand { output, .. } => output.rows.len(),
+            BlockContent::Text { text } => text.len(),
+            _ => 0,
+        };
+        (status, len)
+    }
+
     /// Rebuild cached block heights and prefix-sum Y offsets.
     /// Only recomputes heights for blocks that have changed (new or different content length).
     /// Called at the top of `layout_blocks`.
@@ -1563,16 +1612,20 @@ impl Renderer {
 
         let n = self.blocks.len();
 
-        // Resize height cache to match block count.
+        // Resize caches to match block count.
+        let prev_len = self.block_heights.len();
         self.block_heights.resize(n, 0.0);
+        self.block_fingerprints.resize(n, (0, 0));
 
-        let mut any_changed = params_changed || self.block_heights.len() != n;
+        let mut any_changed = params_changed || prev_len != n;
 
         for i in 0..n {
             let block = &self.blocks[i];
-            // Running blocks always recompute (live terminal output changes size each frame).
+            let fp = Self::block_fingerprint(block);
             let is_running = self.running_block_idx == Some(i);
-            let needs_recompute = params_changed || is_running || i >= self.block_heights.len();
+            let content_changed = i < prev_len && self.block_fingerprints[i] != fp;
+            let needs_recompute = params_changed || is_running || i >= prev_len || content_changed;
+            self.block_fingerprints[i] = fp;
             if needs_recompute {
                 let h = self.block_height(i, block, content_w, phys_font);
                 if (self.block_heights[i] - h).abs() > 0.01 {
@@ -2833,6 +2886,29 @@ impl Renderer {
             let before_chars = self.input_text[..cursor].chars().count();
             let caret_x = text_x + (prefix_chars as f32 + before_chars as f32) * char_w;
             self.input_caret_rect = [caret_x, text_block_y, char_w.max(2.0), line_h_local];
+
+            // Ghost suggestion: render the history suffix in muted color after the caret
+            // when the cursor is at the end of the input and no text follows it.
+            if !self.input_ghost.is_empty()
+                && cursor == self.input_text.len()
+                && !self.input_all_selected
+                && self.input_preedit.is_empty()
+            {
+                let ghost_col = gc(self.theme.muted);
+                // Position right after the caret character (1 char_w past caret_x).
+                let ghost_x = caret_x + char_w;
+                let ghost_w = (text_w - (ghost_x - text_x)).max(1.0);
+                let ghost_buf =
+                    self.make_buffer(&self.input_ghost.clone(), ghost_w, phys_font, ghost_col);
+                results.push((
+                    ghost_buf,
+                    ghost_x,
+                    text_block_y,
+                    ghost_w,
+                    line_h_local,
+                    ghost_col,
+                ));
+            }
             let _ = preedit_active;
         }
 

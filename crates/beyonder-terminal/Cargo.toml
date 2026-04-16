@@ -2,6 +2,9 @@
 name = "beyonder-terminal"
 version.workspace = true
 edition.workspace = true
+description = "PTY management and terminal emulation for Beyond"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 beyonder-core = { workspace = true }
