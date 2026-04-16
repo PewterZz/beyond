@@ -2223,7 +2223,8 @@ impl Renderer {
         let phys_font = self.font_size * sc;
         let mut results = TextBufList::new();
 
-        let cells = self.tui_cells.clone();
+        // Take ownership to avoid cloning — returned at the end.
+        let cells = std::mem::take(&mut self.tui_cells);
         for (row_idx, row) in cells.iter().enumerate() {
             if row.is_empty() {
                 continue;
@@ -2242,6 +2243,7 @@ impl Renderer {
                 results.push((buf, pad + x, y, w, cell_h, color));
             }
         }
+        self.tui_cells = cells;
         results
     }
 
@@ -2259,7 +2261,8 @@ impl Renderer {
         // Use cached layout: skip to first visible block via binary search.
         let first = self.first_visible_block(self.viewport.scroll_offset);
 
-        let blocks = self.blocks.clone();
+        // Take ownership to avoid cloning — returned at the end.
+        let blocks = std::mem::take(&mut self.blocks);
         for block_idx in first..blocks.len() {
             let block = &blocks[block_idx];
             let block_t0 = std::time::Instant::now();
@@ -2626,6 +2629,8 @@ impl Renderer {
                 break;
             }
         }
+
+        self.blocks = blocks;
 
         // Block entries end here. Bar text is appended separately via build_bar_text_buffers.
         let block_entry_count = results.len();
@@ -3721,5 +3726,17 @@ mod tests {
         assert!((prefix[1] - 106.0).abs() < 0.01); // 4 + 100 + 2
         assert!((prefix[2] - 308.0).abs() < 0.01); // 106 + 200 + 2
         assert!((prefix[3] - 360.0).abs() < 0.01); // 308 + 50 + 2
+    }
+
+    /// Verify that mem::take + put-back preserves data (the pattern used to
+    /// eliminate per-frame clones of blocks and tui_cells).
+    #[test]
+    fn mem_take_roundtrip_preserves_data() {
+        let mut data = vec![1, 2, 3, 4, 5];
+        let taken = std::mem::take(&mut data);
+        assert!(data.is_empty());
+        assert_eq!(taken, vec![1, 2, 3, 4, 5]);
+        data = taken;
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
     }
 }
