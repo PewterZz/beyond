@@ -87,6 +87,11 @@ pub static COMMANDS: &[SlashCommand] = &[
         usage: "/theme <name>",
         description: "Switch color theme (catppuccin-mocha | …)",
     },
+    SlashCommand {
+        name: "approval",
+        usage: "/approval bypass|auto|manual",
+        description: "How agent tool calls are gated: bypass (run all), auto (ask for risky), manual (ask for all)",
+    },
 ];
 
 /// Return commands whose name starts with `prefix` (case-insensitive).

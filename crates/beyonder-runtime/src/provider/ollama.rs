@@ -5,6 +5,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use beyonder_acp::client::{AgentEvent, StreamPause, ToolUseReq};
+use beyonder_core::ApprovalMode;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,7 @@ impl OllamaBackend {
         event_tx: UnboundedSender<AgentEvent>,
         tools: Vec<ToolDescriptor>,
         cwd: std::path::PathBuf,
+        approval_mode: ApprovalMode,
     ) -> Self {
         let ollama_tools: Vec<OllamaTool> = tools
             .iter()
@@ -115,7 +117,7 @@ impl OllamaBackend {
 
         let system_msg = OllamaMessage {
             role: "system".to_string(),
-            content: super::build_system_prompt(&cwd, &tools),
+            content: super::build_system_prompt(&cwd, &tools, approval_mode),
             tool_calls: None,
             name: None,
         };

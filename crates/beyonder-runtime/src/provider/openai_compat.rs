@@ -139,6 +139,7 @@ impl OpenAICompatBackend {
         event_tx: UnboundedSender<AgentEvent>,
         tools: Vec<ToolDescriptor>,
         cwd: std::path::PathBuf,
+        approval_mode: beyonder_core::ApprovalMode,
     ) -> Self {
         let oai_tools: Vec<OAITool> = tools
             .iter()
@@ -154,7 +155,7 @@ impl OpenAICompatBackend {
 
         let system_msg = OAIMessage {
             role: "system".to_string(),
-            content: Some(super::build_system_prompt(&cwd, &tools)),
+            content: Some(super::build_system_prompt(&cwd, &tools, approval_mode)),
             tool_calls: None,
             tool_call_id: None,
         };

@@ -3,12 +3,12 @@
 //! creating ApprovalRequest blocks when human approval is needed.
 
 use beyonder_core::{
-    AgentAction, AgentId, Block, BlockContent, BlockKind, BlockStatus, CapabilityKind,
-    CapabilitySet, GrantMode, SessionId,
+    AgentAction, AgentId, ApprovalMode, Block, BlockContent, BlockKind, BlockStatus,
+    CapabilityKind, CapabilitySet, SessionId,
 };
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::info;
 
 /// A pending approval waiting for the human's decision.
 pub struct PendingApproval {
@@ -43,15 +43,31 @@ pub struct CapabilityBroker {
     event_tx: mpsc::Sender<BrokerEvent>,
     /// Pending approvals waiting for human response.
     pending: HashMap<String, oneshot::Sender<ApprovalDecision>>,
+    /// Session-wide approval policy. Overrides per-capability grant modes —
+    /// switching this re-applies on the next action check.
+    approval_mode: ApprovalMode,
 }
 
 impl CapabilityBroker {
     pub fn new(event_tx: mpsc::Sender<BrokerEvent>) -> Self {
+        Self::with_mode(event_tx, ApprovalMode::default())
+    }
+
+    pub fn with_mode(event_tx: mpsc::Sender<BrokerEvent>, mode: ApprovalMode) -> Self {
         Self {
             capabilities: HashMap::new(),
             event_tx,
             pending: HashMap::new(),
+            approval_mode: mode,
         }
+    }
+
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode
+    }
+
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval_mode = mode;
     }
 
     /// Register an agent with its initial capability set.
@@ -68,17 +84,11 @@ impl CapabilityBroker {
         session_id: &SessionId,
     ) -> ActionDecision {
         let kind = action_to_capability_kind(action);
-        let path = action_path(action);
 
-        let grant_mode = self
-            .capabilities
-            .get(agent_id)
-            .and_then(|caps| caps.grant_mode_for(&kind, path.as_ref()))
-            .cloned();
-
-        match grant_mode {
-            Some(GrantMode::Always) => {
-                info!(agent = %agent_id, action = ?kind, "Auto-approved (Always)");
+        // Session-wide ApprovalMode is the top-level gate.
+        match self.approval_mode {
+            ApprovalMode::Bypass => {
+                info!(agent = %agent_id, action = ?kind, "Auto-approved (bypass)");
                 let _ = self
                     .event_tx
                     .send(BrokerEvent::AutoApproved {
@@ -86,35 +96,40 @@ impl CapabilityBroker {
                         action: kind.display_name().to_string(),
                     })
                     .await;
-                ActionDecision::Approved
+                return ActionDecision::Approved;
             }
-            Some(GrantMode::Never) => {
-                warn!(agent = %agent_id, action = ?kind, "Denied (Never)");
-                let _ = self
-                    .event_tx
-                    .send(BrokerEvent::Denied {
-                        agent_id: agent_id.clone(),
-                        action: kind.display_name().to_string(),
-                    })
-                    .await;
-                ActionDecision::Denied("This action is not permitted for this agent.".to_string())
+            ApprovalMode::Auto => {
+                if is_safe_action(action) {
+                    info!(agent = %agent_id, action = ?kind, "Auto-approved (auto/safe)");
+                    let _ = self
+                        .event_tx
+                        .send(BrokerEvent::AutoApproved {
+                            agent_id: agent_id.clone(),
+                            action: kind.display_name().to_string(),
+                        })
+                        .await;
+                    return ActionDecision::Approved;
+                }
+                // Fall through to approval request below.
             }
-            _ => {
-                // PerUse, Once, or no capability — requires human approval.
-                let (tx, rx) = oneshot::channel();
-                let block = make_approval_block(agent_id, action, session_id);
-                let block_id = block.id.clone();
-
-                self.pending.insert(block_id.0.clone(), tx);
-
-                let _ = self
-                    .event_tx
-                    .send(BrokerEvent::ApprovalRequired(block))
-                    .await;
-
-                ActionDecision::NeedsApproval { approval_rx: rx }
+            ApprovalMode::Manual => {
+                // Fall through to approval request below.
             }
         }
+
+        // Ask the human.
+        let (tx, rx) = oneshot::channel();
+        let block = make_approval_block(agent_id, action, session_id);
+        let block_id = block.id.clone();
+
+        self.pending.insert(block_id.0.clone(), tx);
+
+        let _ = self
+            .event_tx
+            .send(BrokerEvent::ApprovalRequired(block))
+            .await;
+
+        ActionDecision::NeedsApproval { approval_rx: rx }
     }
 
     /// Called when the human makes an approval decision for a given block.
@@ -141,6 +156,12 @@ pub enum ActionDecision {
     },
 }
 
+/// Whether an action is safe enough to skip approval in Auto mode.
+/// Reads are safe; anything that mutates, executes, or reaches the network is not.
+fn is_safe_action(action: &AgentAction) -> bool {
+    matches!(action, AgentAction::FileRead { .. })
+}
+
 fn action_to_capability_kind(action: &AgentAction) -> CapabilityKind {
     match action {
         AgentAction::FileRead { .. } => CapabilityKind::FileRead { patterns: vec![] },
@@ -159,6 +180,7 @@ fn action_to_capability_kind(action: &AgentAction) -> CapabilityKind {
     }
 }
 
+#[allow(dead_code)]
 fn action_path(action: &AgentAction) -> Option<std::path::PathBuf> {
     match action {
         AgentAction::FileRead { path }

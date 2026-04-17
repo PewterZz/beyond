@@ -183,6 +183,9 @@ pub struct Renderer {
     pub pill_rects: Vec<[f32; 4]>,
     /// OSC 8 hyperlink hit rects: ([x,y,w,h], url). Rebuilt each frame.
     pub link_rects: Vec<([f32; 4], String)>,
+    /// Approval block button rects: ([x,y,w,h], block_id, is_approve).
+    /// Rebuilt each frame while approval blocks are visible.
+    pub approval_button_rects: Vec<([f32; 4], String, bool)>,
     /// Bounding rects [x, y, w, h] per dropdown item (written during layout).
     pub dropdown_item_rects: Vec<[f32; 4]>,
 
@@ -196,6 +199,10 @@ pub struct Renderer {
     // Mode switcher — bottom-left of the input bar.
     pub mode_label: String,
     pub mode_pill_rect: [f32; 4],
+
+    /// Approval-mode pill label: "bypass" | "auto" | "manual".
+    pub approval_mode_label: String,
+    pub approval_mode_pill_rect: [f32; 4],
 
     /// Active agent model name — shown as a pill in the top-right of the input bar.
     pub agent_model: String,
@@ -482,12 +489,15 @@ impl Renderer {
             open_dropdown: None,
             pill_rects: vec![],
             link_rects: vec![],
+            approval_button_rects: vec![],
             dropdown_item_rects: vec![],
             command_palette: None,
             cmd_palette_hovered: None,
             cmd_palette_rects: vec![],
             mode_label: "auto".to_string(),
             mode_pill_rect: [0.0; 4],
+            approval_mode_label: "bypass".to_string(),
+            approval_mode_pill_rect: [0.0; 4],
             agent_model: String::new(),
             glyph_buf_cache: HashMap::new(),
             frame_counter: 0,
@@ -1116,6 +1126,12 @@ impl Renderer {
         w > 0.0 && px >= x && px < x + w && py >= y && py < y + h
     }
 
+    /// Returns true if the approval-mode pill was clicked.
+    pub fn approval_mode_pill_hit(&self, px: f32, py: f32) -> bool {
+        let [x, y, w, h] = self.approval_mode_pill_rect;
+        w > 0.0 && px >= x && px < x + w && py >= y && py < y + h
+    }
+
     /// Returns the index of the pill that was clicked (0=conda, 1=node, 2=dir).
     pub fn pill_hit(&self, px: f32, py: f32) -> Option<usize> {
         for (i, rect) in self.pill_rects.iter().enumerate() {
@@ -1452,7 +1468,8 @@ impl Renderer {
             self.append_bar_rects(&mut rects);
         }
         self.append_tab_bar_rects(&mut rects);
-        self.rect_pipeline.upload_instances(&self.queue, &rects);
+        self.rect_pipeline
+            .upload_instances(&self.device, &self.queue, &rects);
 
         // --- Text layout ---
         // Buffers must outlive the TextArea slices, so we build them here.
@@ -1793,7 +1810,9 @@ impl Renderer {
     fn layout_blocks(&mut self) -> (Vec<RectInstance>, f32) {
         self.rebuild_block_layout_cache();
         self.link_rects.clear();
+        self.approval_button_rects.clear();
         let mut link_rects_local: Vec<([f32; 4], String)> = vec![];
+        let mut approval_btns_local: Vec<([f32; 4], String, bool)> = vec![];
         let mut rects = vec![];
         let sc = self.scale_factor;
         let padding = PADDING * sc;
@@ -1824,7 +1843,16 @@ impl Renderer {
                         render_agent_message(block, x, sy, content_w, h, sc, &mut rects);
                     }
                     BlockContent::ApprovalRequest { .. } => {
-                        render_approval_block(block, x, sy, content_w, h, sc, &mut rects);
+                        render_approval_block(
+                            block,
+                            x,
+                            sy,
+                            content_w,
+                            h,
+                            sc,
+                            &mut rects,
+                            &mut approval_btns_local,
+                        );
                     }
                     _ => {
                         render_block_background(block, x, sy, content_w, h, &mut rects);
@@ -2065,6 +2093,7 @@ impl Renderer {
 
         let total_h = *self.block_y_prefix.last().unwrap_or(&0.0);
         self.link_rects.extend(link_rects_local);
+        self.approval_button_rects.extend(approval_btns_local);
         (rects, total_h)
     }
 
@@ -2100,7 +2129,13 @@ impl Renderer {
         // Context pills.
         let pill_hpad = 12.0 * sc;
         let pill_gap = 8.0 * sc;
-        let pill_char_w = phys_font * 0.6 * 0.75;
+        // Char width estimate for text at pill_font_size (= phys_font * 0.75).
+        // Bumped from 0.6 to 0.7 so the last glyph doesn't clip when the font
+        // falls back from JetBrains Mono Nerd Font (especially on Linux).
+        let pill_char_w = phys_font * 0.7 * 0.75;
+        // Nerd Font icons are drawn near full-em (~1.0x) rather than 0.7x,
+        // so reserve extra space per pill to fit the leading icon glyph.
+        let pill_icon_slack = phys_font * 0.75 * 0.5;
         let pill_h = 22.0 * sc;
         let pill_top = bar_y + 14.0 * sc;
         let pill_bgs: [[f32; 4]; 3] = [
@@ -2120,7 +2155,8 @@ impl Renderer {
         for (i, label) in pills.iter().enumerate() {
             let icon = pill_icons.get(i).copied().unwrap_or(' ');
             let full_label = format!("{} {}", icon, label);
-            let pill_w = full_label.chars().count() as f32 * pill_char_w + 2.0 * pill_hpad;
+            let pill_w =
+                full_label.chars().count() as f32 * pill_char_w + pill_icon_slack + 2.0 * pill_hpad;
             let bg = pill_bgs
                 .get(i)
                 .copied()
@@ -2161,8 +2197,12 @@ impl Renderer {
 
         // Mode switcher pill.
         {
+            // Text-only pills (no icon): font is phys_font * 0.75, so char width
+            // is ~0.6x that. Bump to 0.7x so the last glyph doesn't clip when
+            // the Nerd Font family falls back on Linux.
+            let mode_char_w = phys_font * 0.75 * 0.7;
             let mode_text = self.mode_label.clone();
-            let mode_w = mode_text.chars().count() as f32 * pill_char_w + 2.0 * pill_hpad;
+            let mode_w = mode_text.chars().count() as f32 * mode_char_w + 2.0 * pill_hpad;
             let mode_h = 20.0 * sc;
             let mode_x = 14.0 * sc;
             let mode_y = bar_y + bar_h - mode_h - 8.0 * sc;
@@ -2182,6 +2222,24 @@ impl Renderer {
                     .with_border(1.0, mode_border),
             );
             self.mode_pill_rect = [mode_x, mode_y, mode_w, mode_h];
+
+            // Approval-mode pill — sits immediately right of the mode pill.
+            let approval_text = self.approval_mode_label.clone();
+            let approval_w = approval_text.chars().count() as f32 * mode_char_w + 2.0 * pill_hpad;
+            let approval_gap = 6.0 * sc;
+            let approval_x = mode_x + mode_w + approval_gap;
+            let (approval_bg, approval_border) = match approval_text.as_str() {
+                "bypass" => ([0.155, 0.075, 0.075, 1.0], [0.953, 0.545, 0.659, 0.8]),
+                "auto" => ([0.080, 0.148, 0.080, 1.0], [0.651, 0.890, 0.631, 0.8]),
+                "manual" => ([0.098, 0.098, 0.118, 1.0], [0.345, 0.357, 0.439, 0.6]),
+                _ => ([0.098, 0.098, 0.118, 1.0], [0.345, 0.357, 0.439, 0.6]),
+            };
+            rects.push(
+                RectInstance::filled(approval_x, mode_y, approval_w, mode_h, approval_bg)
+                    .with_radius(4.0)
+                    .with_border(1.0, approval_border),
+            );
+            self.approval_mode_pill_rect = [approval_x, mode_y, approval_w, mode_h];
         }
 
         // Dropdown rects.
@@ -3068,12 +3126,14 @@ impl Renderer {
             let _ = preedit_active;
         }
 
-        // Pill text — one entry per pill.
+        // Pill text — one entry per pill. Keep these constants in lockstep
+        // with append_bar_rects so the rect and the shaped text share geometry.
         let pill_top = bar_y + 14.0 * sc;
         let pill_h = 22.0 * sc;
         let pill_hpad = 12.0 * sc;
         let pill_gap = 8.0 * sc;
-        let pill_char_w = phys_font * 0.6 * 0.75;
+        let pill_char_w = phys_font * 0.7 * 0.75;
+        let pill_icon_slack = phys_font * 0.75 * 0.5;
         let pill_font_size = phys_font * 0.75;
         let pill_line_h = pill_font_size * 1.4;
         let pill_text_y = pill_top + (pill_h - pill_line_h) * 0.5;
@@ -3088,7 +3148,8 @@ impl Renderer {
         for (i, label) in pills.iter().enumerate() {
             let icon = pill_icons.get(i).copied().unwrap_or(' ');
             let full_label = format!("{} {}", icon, label);
-            let pill_w = full_label.chars().count() as f32 * pill_char_w + 2.0 * pill_hpad;
+            let pill_w =
+                full_label.chars().count() as f32 * pill_char_w + pill_icon_slack + 2.0 * pill_hpad;
             let color = pill_text_colors
                 .get(i)
                 .copied()
@@ -3158,6 +3219,37 @@ impl Renderer {
                     mode_w - 2.0 * hpad,
                     mode_line_h,
                     mode_color,
+                ));
+            }
+        }
+
+        // Approval-mode pill text.
+        {
+            let [ax, ay, aw, ah] = self.approval_mode_pill_rect;
+            if aw > 0.0 {
+                let approval_text = self.approval_mode_label.clone();
+                let approval_font = phys_font * 0.75;
+                let approval_line_h = approval_font * 1.4;
+                let approval_color = match approval_text.as_str() {
+                    "bypass" => gc(self.theme.red),
+                    "auto" => gc(self.theme.green),
+                    _ => gc(self.theme.muted),
+                };
+                let hpad = 12.0 * sc;
+                let buf = self.make_pill_buffer(
+                    &approval_text,
+                    aw - 2.0 * hpad,
+                    approval_font,
+                    approval_color,
+                );
+                let ty = ay + (ah - approval_line_h) * 0.5;
+                results.push((
+                    buf,
+                    ax + hpad,
+                    ty,
+                    aw - 2.0 * hpad,
+                    approval_line_h,
+                    approval_color,
                 ));
             }
         }

@@ -171,9 +171,28 @@ impl RectPipeline {
         );
     }
 
-    pub fn upload_instances(&self, queue: &wgpu::Queue, instances: &[RectInstance]) {
+    pub fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[RectInstance],
+    ) {
         if instances.is_empty() {
             return;
+        }
+        let needed = instances.len() as u32;
+        if needed > self.instance_capacity {
+            // Grow to the next power of two so we don't reallocate every frame
+            // when the scene's rect count climbs (e.g. long block streams,
+            // TUI modes with many cell rects).
+            let new_cap = needed.next_power_of_two().max(self.instance_capacity * 2);
+            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rect_instances"),
+                size: (std::mem::size_of::<RectInstance>() as u64) * new_cap as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = new_cap;
         }
         queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }

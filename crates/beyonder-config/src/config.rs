@@ -1,3 +1,4 @@
+use beyonder_core::ApprovalMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -99,6 +100,9 @@ pub struct BeyonderConfig {
     pub model: String,
     #[serde(default)]
     pub provider: ProviderConfig,
+    /// Policy governing whether agent tool calls need user approval.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
 }
 
 fn default_theme_name() -> String {
@@ -118,6 +122,7 @@ impl Default for BeyonderConfig {
             data_dir: default_data_dir(),
             model: default_model(),
             provider: ProviderConfig::default(),
+            approval_mode: ApprovalMode::default(),
         }
     }
 }

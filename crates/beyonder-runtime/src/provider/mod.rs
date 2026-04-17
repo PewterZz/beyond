@@ -5,6 +5,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use beyonder_acp::client::StreamPause;
+use beyonder_core::ApprovalMode;
 
 pub mod ollama;
 pub use ollama::{OllamaBackend, OllamaConfig, ToolDescriptor};
@@ -18,7 +19,11 @@ pub use env_probe::{probe_environment, EnvProbe};
 /// Build the system prompt injected as `messages[0]` for all LLM backends.
 /// Detects OS + available tooling once and embeds craft rules tailored to
 /// what's actually on the user's machine.
-pub fn build_system_prompt(cwd: &std::path::Path, tools: &[ToolDescriptor]) -> String {
+pub fn build_system_prompt(
+    cwd: &std::path::Path,
+    tools: &[ToolDescriptor],
+    approval_mode: ApprovalMode,
+) -> String {
     let env = env_probe::probe_environment();
     let tool_list = tools
         .iter()
@@ -82,6 +87,24 @@ Web: httpie={hx} curl-impersonate={ci} aria2={ar} yt-dlp={yt} pandoc={pd} lynx={
 
     let os_specific = os_specific_rules(&env);
 
+    let approval_block = match approval_mode {
+        ApprovalMode::Bypass => String::new(),
+        ApprovalMode::Auto => "\n## Approval policy — Auto\n\
+The terminal gates tool calls by risk. Safe reads (file reads, listing, searching, \
+git status, environment inspection) run immediately. Risky calls (shell execution, \
+file writes/deletes, network requests, spawning sub-agents) pause execution and ask \
+the user to Approve / Deny on-screen. Before such a call, write a one-sentence \
+explanation of what you're about to do and why — that text is what the user sees \
+while deciding. If denied, acknowledge and adjust; don't retry the same call.\n"
+            .to_string(),
+        ApprovalMode::Manual => "\n## Approval policy — Manual\n\
+Every tool call — including reads — pauses execution until the user explicitly \
+approves on-screen. Before each call, state plainly what you're about to do and \
+why so the user can decide quickly. If a call is denied, stop that line of action \
+and ask the user what to do instead.\n"
+            .to_string(),
+    };
+
     format!(
         "You are Beyond — an AI coding agent embedded inside an agent-native terminal built in Rust.\n\
 You run directly on the user's machine with full access to their local environment.\n\
@@ -94,7 +117,7 @@ Toolchain: {toolchain}\n\
 \n\
 ## Tools\n\
 {tool_list}\n\
-\n\
+{approval_block}\n\
 Use tools proactively: read files, run shell commands, inspect output, run tests, \
 check git status, install dependencies, and execute code. Compose shell commands \
 to accomplish coding tasks end-to-end — don't stop at describing the fix, apply it.\n\
@@ -194,6 +217,7 @@ State what you did and what changed — skip narration of every tool call.",
         cwd = cwd.display(),
         toolchain = toolchain,
         tool_list = tool_list,
+        approval_block = approval_block,
         sed_rule = env.sed_inplace_rule(),
         os_specific = os_specific,
     )

@@ -4,14 +4,17 @@
 use anyhow::Result;
 use beyonder_acp::client::{AgentEvent, StreamPause};
 use beyonder_acp::AcpClient;
-use beyonder_core::{AgentId, AgentInfo, AgentKind, CapabilitySet, DeathReason, SessionId};
+use beyonder_core::{
+    AgentId, AgentInfo, AgentKind, ApprovalMode, CapabilitySet, DeathReason, SessionId,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::capability_broker::{ActionDecision, ApprovalDecision, CapabilityBroker};
 use crate::provider::{
     ollama::{OllamaBackend, OllamaConfig, ToolDescriptor},
     openai_compat::{OpenAICompatBackend, OpenAICompatConfig},
@@ -19,6 +22,10 @@ use crate::provider::{
 };
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{ToolContext, ToolOutput};
+
+/// Shared handle to the capability broker — held by both the UI (to resolve
+/// approvals on user click) and per-agent turn tasks (to gate tool calls).
+pub type SharedBroker = Arc<Mutex<CapabilityBroker>>;
 
 /// Events from the supervisor.
 #[derive(Debug)]
@@ -83,6 +90,8 @@ impl AgentSupervisor {
         name: impl Into<String>,
         kind: AgentKind,
         capabilities: CapabilitySet,
+        broker: SharedBroker,
+        approval_mode: ApprovalMode,
     ) -> Result<AgentId> {
         let name = name.into();
         let mut info = AgentInfo::new(&name, kind.clone());
@@ -139,6 +148,7 @@ impl AgentSupervisor {
                     event_tx,
                     tool_descs,
                     cwd.clone(),
+                    approval_mode,
                 ))
             }
             AgentKind::LlamaCpp {
@@ -167,6 +177,7 @@ impl AgentSupervisor {
                     event_tx,
                     tool_descs,
                     cwd.clone(),
+                    approval_mode,
                 ))
             }
             AgentKind::Mlx {
@@ -195,6 +206,7 @@ impl AgentSupervisor {
                     event_tx,
                     tool_descs,
                     cwd.clone(),
+                    approval_mode,
                 ))
             }
             _ => anyhow::bail!("Unsupported agent kind in MVP"),
@@ -229,15 +241,19 @@ impl AgentSupervisor {
         let sup_tx_driver = self.event_tx.clone();
         let aid_driver = agent_id.clone();
         let wake_driver = self.wake.clone();
+        let broker_driver = broker.clone();
+        let session_driver = SessionId::new();
         tokio::spawn(async move {
             agent_turn_task(
                 aid_driver,
+                session_driver,
                 backend,
                 registry,
                 cwd,
                 cmd_rx,
                 sup_tx_driver,
                 wake_driver,
+                broker_driver,
             )
             .await;
         });
@@ -298,14 +314,17 @@ impl AgentSupervisor {
 /// Background task that owns one agent backend and drives its turn loop.
 /// Receives prompts from the channel; each prompt triggers a full turn
 /// (including tool-use loops) without blocking the UI event loop.
+#[allow(clippy::too_many_arguments)]
 async fn agent_turn_task(
     agent_id: AgentId,
+    session_id: SessionId,
     mut backend: Box<dyn AgentBackend + Send>,
     registry: ToolRegistry,
     cwd: PathBuf,
     mut cmd_rx: mpsc::UnboundedReceiver<AgentCmd>,
     sup_tx: mpsc::UnboundedSender<SupervisorEvent>,
     wake: Option<WakeFn>,
+    broker: SharedBroker,
 ) {
     // Helper: send a supervisor event and wake the UI event loop so it
     // drains the channel promptly (even in ControlFlow::Wait mode).
@@ -382,8 +401,16 @@ async fn agent_turn_task(
                     // Execute tools, emit results to UI, and collect for the backend.
                     let mut results: Vec<(String, serde_json::Value)> = vec![];
                     for tool in tools {
-                        let output =
-                            run_tool(&registry, &tool.name, tool.input.clone(), cwd.clone()).await;
+                        let output = run_tool(
+                            &registry,
+                            &tool.name,
+                            tool.input.clone(),
+                            cwd.clone(),
+                            &agent_id,
+                            &session_id,
+                            &broker,
+                        )
+                        .await;
                         emit(SupervisorEvent::AgentEvent {
                             agent_id: agent_id.clone(),
                             event: AgentEvent::ToolResult {
@@ -407,24 +434,57 @@ async fn agent_turn_task(
     }
 }
 
-/// Execute a single tool call (auto-approved for agent backends).
+/// Execute a single tool call, gated by the capability broker.
+/// In Bypass mode the broker returns Approved immediately; in Auto/Manual it
+/// may pause on a oneshot until the user clicks Approve or Deny.
+#[allow(clippy::too_many_arguments)]
 async fn run_tool(
     registry: &ToolRegistry,
     name: &str,
     input: serde_json::Value,
     cwd: PathBuf,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    broker: &SharedBroker,
 ) -> ToolOutput {
-    match registry.get(name) {
-        Some(tool) => {
+    let tool = match registry.get(name) {
+        Some(t) => t.clone(),
+        None => return ToolOutput::error(format!("Unknown tool: {name}")),
+    };
+
+    let action = tool.required_action(&input);
+    let decision = {
+        let mut guard = broker.lock().await;
+        guard.check_action(agent_id, &action, session_id).await
+    };
+
+    match decision {
+        ActionDecision::Approved => {
             let ctx = ToolContext {
-                agent_id: AgentId::new(),
-                session_id: SessionId::new(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
                 cwd,
             };
             tool.execute(input, ctx, CancellationToken::new())
                 .await
                 .unwrap_or_else(|e| ToolOutput::error(e.to_string()))
         }
-        None => ToolOutput::error(format!("Unknown tool: {name}")),
+        ActionDecision::Denied(reason) => ToolOutput::error(format!("Permission denied: {reason}")),
+        ActionDecision::NeedsApproval { approval_rx } => match approval_rx.await {
+            Ok(ApprovalDecision::Granted) | Ok(ApprovalDecision::GrantedAlways) => {
+                let ctx = ToolContext {
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    cwd,
+                };
+                tool.execute(input, ctx, CancellationToken::new())
+                    .await
+                    .unwrap_or_else(|e| ToolOutput::error(e.to_string()))
+            }
+            Ok(ApprovalDecision::Denied) => {
+                ToolOutput::error("Permission denied by user".to_string())
+            }
+            Err(_) => ToolOutput::error("Approval channel closed".to_string()),
+        },
     }
 }

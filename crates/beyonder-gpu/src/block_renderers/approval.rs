@@ -5,6 +5,7 @@ use super::render_block_background;
 use crate::pipeline::RectInstance;
 use beyonder_core::Block;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_approval_block(
     block: &Block,
     x: f32,
@@ -13,6 +14,7 @@ pub fn render_approval_block(
     height: f32,
     scale: f32,
     rects: &mut Vec<RectInstance>,
+    button_rects: &mut Vec<([f32; 4], String, bool)>,
 ) {
     render_block_background(block, x, y, width, height, rects);
 
@@ -40,18 +42,16 @@ pub fn render_approval_block(
     let btn_h = 24.0 * scale;
     let btn_r = 4.0 * scale;
     let gap = 10.0 * scale;
+    let approve_x = x + gap;
+    let deny_x = x + gap + btn_w + gap;
     rects.push(
-        RectInstance::filled(x + gap, btn_y, btn_w, btn_h, [0.210, 0.500, 0.245, 1.0])
+        RectInstance::filled(approve_x, btn_y, btn_w, btn_h, [0.210, 0.500, 0.245, 1.0])
             .with_radius(btn_r),
     );
     rects.push(
-        RectInstance::filled(
-            x + gap + btn_w + gap,
-            btn_y,
-            btn_w,
-            btn_h,
-            [0.530, 0.165, 0.220, 1.0],
-        )
-        .with_radius(btn_r),
+        RectInstance::filled(deny_x, btn_y, btn_w, btn_h, [0.530, 0.165, 0.220, 1.0])
+            .with_radius(btn_r),
     );
+    button_rects.push(([approve_x, btn_y, btn_w, btn_h], block.id.0.clone(), true));
+    button_rects.push(([deny_x, btn_y, btn_w, btn_h], block.id.0.clone(), false));
 }

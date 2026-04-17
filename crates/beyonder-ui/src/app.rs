@@ -8,8 +8,8 @@ use beyonder_core::{
 };
 use beyonder_gpu::Renderer;
 use beyonder_runtime::{
-    capability_broker::{BrokerEvent, CapabilityBroker},
-    supervisor::{AgentSupervisor, SupervisorEvent},
+    capability_broker::{ApprovalDecision, BrokerEvent, CapabilityBroker},
+    supervisor::{AgentSupervisor, SharedBroker, SupervisorEvent},
 };
 use beyonder_store::{BlockStore, SessionStore, Store};
 use beyonder_terminal::block_builder::BuildEvent;
@@ -532,7 +532,7 @@ pub struct App {
     pub store: Store,
     pub session: Session,
     pub supervisor: AgentSupervisor,
-    pub capability_broker: CapabilityBroker,
+    pub capability_broker: SharedBroker,
     pub pty: Option<PtySession>,
     pub block_builder: BlockBuilder,
     pub term_grid: TermGrid,
@@ -684,7 +684,9 @@ impl App {
         let (broker_tx, broker_rx) = mpsc::channel(64);
         let (supervisor_tx, supervisor_rx) = mpsc::unbounded_channel();
 
-        let capability_broker = CapabilityBroker::new(broker_tx);
+        let capability_broker: SharedBroker = Arc::new(tokio::sync::Mutex::new(
+            CapabilityBroker::with_mode(broker_tx, config.approval_mode),
+        ));
         let mut supervisor = AgentSupervisor::new(supervisor_tx);
         let wake_proxy_sup = event_loop_proxy.clone();
         supervisor.set_wake(std::sync::Arc::new(move || {
@@ -1366,7 +1368,7 @@ impl App {
                         self.last_lmb_press = None;
                     } else {
                         self.last_lmb_press = Some((now, self.cursor_pos));
-                        self.handle_click(self.cursor_pos);
+                        self.handle_click(self.cursor_pos).await;
                     }
                 }
                 false
@@ -1643,7 +1645,25 @@ impl App {
         }
     }
 
-    fn handle_click(&mut self, pos: (f32, f32)) {
+    async fn handle_click(&mut self, pos: (f32, f32)) {
+        // Approval block buttons — take priority over every other hit-test so
+        // they can't be shadowed by block-selection or link overlays.
+        let hit_approval =
+            self.renderer
+                .approval_button_rects
+                .iter()
+                .find_map(|(rect, block_id, is_approve)| {
+                    let [rx, ry, rw, rh] = *rect;
+                    if pos.0 >= rx && pos.0 < rx + rw && pos.1 >= ry && pos.1 < ry + rh {
+                        Some((block_id.clone(), *is_approve))
+                    } else {
+                        None
+                    }
+                });
+        if let Some((block_id, is_approve)) = hit_approval {
+            self.resolve_approval_block(&block_id, is_approve).await;
+            return;
+        }
         // OSC 8 hyperlink click.
         // file:// or bare absolute-path links open in an editor tab; everything
         // else (http, https, mailto, ...) hands off to the system handler.
@@ -1691,6 +1711,25 @@ impl App {
                 AppMode::Cmd => AppMode::Agent,
                 AppMode::Agent => AppMode::Auto,
             };
+            return;
+        }
+        // Approval-mode pill click — cycle bypass → auto → manual → bypass.
+        if self.renderer.approval_mode_pill_hit(pos.0, pos.1) {
+            use beyonder_core::ApprovalMode;
+            let new_mode = match self.config.approval_mode {
+                ApprovalMode::Bypass => ApprovalMode::Auto,
+                ApprovalMode::Auto => ApprovalMode::Manual,
+                ApprovalMode::Manual => ApprovalMode::Bypass,
+            };
+            self.config.approval_mode = new_mode;
+            self.capability_broker
+                .lock()
+                .await
+                .set_approval_mode(new_mode);
+            if let Err(e) = self.config.save() {
+                warn!("Failed to save config: {e}");
+            }
+            info!("Approval mode set: {}", new_mode.label());
             return;
         }
         // Command palette click: fill the selected command into the input.
@@ -1760,6 +1799,38 @@ impl App {
             self.renderer.selected_block = None;
             self.renderer.selected_sub_output = false;
             self.renderer.clear_text_selection();
+        }
+    }
+
+    /// Resolve a pending approval block: notify the broker so the waiting
+    /// tool call unblocks, and update the block's displayed state.
+    async fn resolve_approval_block(&mut self, block_id: &str, granted: bool) {
+        let decision = if granted {
+            ApprovalDecision::Granted
+        } else {
+            ApprovalDecision::Denied
+        };
+        self.capability_broker
+            .lock()
+            .await
+            .resolve_approval(block_id, decision);
+
+        if let Some(block) = self.blocks.iter_mut().find(|b| b.id.0 == block_id) {
+            if let BlockContent::ApprovalRequest {
+                granted: g,
+                granter,
+                ..
+            } = &mut block.content
+            {
+                *g = Some(granted);
+                *granter = Some(beyonder_core::ActorId::Human);
+            }
+            block.status = if granted {
+                BlockStatus::Completed
+            } else {
+                BlockStatus::Failed
+            };
+            self.blocks_dirty = true;
         }
     }
 
@@ -2694,9 +2765,15 @@ impl App {
                     api_key_env: api_key_env.clone(),
                 },
             };
-            match self.supervisor.spawn_agent(name, kind, caps).await {
+            let approval_mode = self.config.approval_mode;
+            let broker = self.capability_broker.clone();
+            match self
+                .supervisor
+                .spawn_agent(name, kind, caps, broker, approval_mode)
+                .await
+            {
                 Ok(agent_id) => {
-                    self.capability_broker.register_agent(
+                    self.capability_broker.lock().await.register_agent(
                         agent_id.clone(),
                         CapabilitySet::default_coding_agent(self.session.working_directory.clone()),
                     );
@@ -2849,6 +2926,34 @@ impl App {
             }
             ["/mode"] => {
                 self.push_text_block(format!("Current mode: {}", self.app_mode.label()));
+            }
+            ["/approval", policy] => match beyonder_core::ApprovalMode::from_str_ci(policy) {
+                Some(new_mode) => {
+                    self.config.approval_mode = new_mode;
+                    self.capability_broker
+                        .lock()
+                        .await
+                        .set_approval_mode(new_mode);
+                    if let Err(e) = self.config.save() {
+                        warn!("Failed to save config: {e}");
+                    }
+                    self.push_text_block(format!(
+                            "Approval mode: {} (applies to newly spawned agents' system prompt; the broker switches immediately)",
+                            new_mode.label()
+                        ));
+                    info!("Approval mode set: {}", new_mode.label());
+                }
+                None => {
+                    self.push_text_block(
+                        "Unknown approval mode. Use: bypass | auto | manual".into(),
+                    );
+                }
+            },
+            ["/approval"] => {
+                self.push_text_block(format!(
+                    "Current approval mode: {}\n  bypass  — run every agent tool call without asking (default)\n  auto    — ask for risky calls (writes, deletes, shell, network, agent spawn)\n  manual  — ask for every tool call",
+                    self.config.approval_mode.label()
+                ));
             }
             ["/session", "new"] => {
                 let cwd = self.block_builder.cwd.clone();
@@ -3050,7 +3155,7 @@ impl App {
     /// Theme changes take effect immediately; model / provider changes apply
     /// on the next agent spawn (mirrors the `/model` and `/provider` commands).
     /// Font changes require a restart — a one-shot notice is posted.
-    fn apply_config_reload(&mut self) {
+    async fn apply_config_reload(&mut self) {
         let new_config = BeyonderConfig::load_or_default();
         let mut notes: Vec<String> = Vec::new();
 
@@ -3067,6 +3172,13 @@ impl App {
         if new_provider_name != old_provider_name {
             self.active_provider = new_provider_name.to_string();
             notes.push(format!("provider -> {} (next spawn)", new_provider_name));
+        }
+        if new_config.approval_mode != self.config.approval_mode {
+            self.capability_broker
+                .lock()
+                .await
+                .set_approval_mode(new_config.approval_mode);
+            notes.push(format!("approval -> {}", new_config.approval_mode.label()));
         }
         if new_config.font.family != self.config.font.family
             || (new_config.font.size - self.config.font.size).abs() > f32::EPSILON
@@ -3152,7 +3264,7 @@ impl App {
             }
         }
         if config_changed {
-            self.apply_config_reload();
+            self.apply_config_reload().await;
             had_work = true;
         }
 
@@ -3904,6 +4016,9 @@ impl App {
 
         // Sync mode switcher label.
         self.renderer.mode_label = self.app_mode.label().to_string();
+
+        // Sync approval-mode pill label.
+        self.renderer.approval_mode_label = self.config.approval_mode.label().to_string();
 
         // Sync tab strip state.
         self.renderer.tab_labels = self.tab_titles.clone();

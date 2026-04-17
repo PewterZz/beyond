@@ -96,6 +96,39 @@ pub enum GrantMode {
     Never,
 }
 
+/// User-selectable policy for how agent tool calls should be gated.
+/// Orthogonal to per-capability GrantMode: this is the session-wide switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Every agent tool call runs without asking — current default behaviour.
+    #[default]
+    Bypass,
+    /// Agent is instructed to flag risky calls; the broker honours the flag.
+    Auto,
+    /// Every agent tool call requires explicit user approval.
+    Manual,
+}
+
+impl ApprovalMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_str_ci(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "bypass" | "off" => Some(Self::Bypass),
+            "auto" | "smart" => Some(Self::Auto),
+            "manual" | "all" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
 /// A set of capabilities held by an agent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilitySet {
