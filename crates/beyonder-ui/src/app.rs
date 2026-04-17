@@ -98,10 +98,8 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded))
 }
 
-/// Shell-quote a path for safe interpolation into a command string.
-#[allow(dead_code)]
-fn shell_quote(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
+/// Shell-quote a string for safe interpolation into a command string.
+fn shell_quote(s: &str) -> String {
     // Single-quote wrap; replace any single quote with '"'"'
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
@@ -722,72 +720,70 @@ impl App {
             let _ = wake_proxy.send_event(());
         });
 
-        let pty = if let Some(path) = editor_only_path {
-            // Editor-only: exec the editor directly, no shell hooks, no rc files.
-            let editor = std::env::var("BEYONDER_EDITOR")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(find_editor)
-                .unwrap_or_else(|| "nvim".to_string());
-            // SAFETY: called before any async task can observe env state.
-            unsafe {
-                std::env::remove_var("BEYONDER_EDITOR");
-            }
-            match PtySession::spawn_exec_sized_with_wake(
-                session_id.clone(),
-                &editor,
-                &[path.as_str()],
-                &cwd,
-                &[],
-                pty_cols,
-                pty_rows,
-                wake_fn,
-            ) {
-                Ok(p) => {
-                    info!("Editor PTY spawned: {editor} {path}");
-                    Some(p)
-                }
-                Err(e) => {
-                    warn!("Failed to spawn editor PTY: {e}");
-                    None
-                }
-            }
-        } else {
-            // Spawn the shell PTY.
-            let shell_env = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-            let shell = config.shell.program.as_deref().unwrap_or(&shell_env);
-            match PtySession::spawn_sized_with_wake(
-                session_id.clone(),
-                shell,
-                &cwd,
-                &[],
-                pty_cols,
-                pty_rows,
-                wake_fn,
-            ) {
-                Ok(mut p) => {
-                    info!("Shell PTY spawned");
-                    // `BEYONDER_INITIAL_CMD` lets a parent process preload a
-                    // command into the first tab's shell. Preserved for legacy
-                    // callers that still use it instead of BEYONDER_EDIT_PATH.
-                    if let Ok(cmd) = std::env::var("BEYONDER_INITIAL_CMD") {
-                        if !cmd.trim().is_empty() {
-                            let line = format!("{}\n", cmd.trim_end_matches('\n'));
-                            if let Err(e) = p.write(line.as_bytes()) {
-                                warn!("Failed to write BEYONDER_INITIAL_CMD to PTY: {e}");
-                            }
-                        }
-                        // SAFETY: called before any async task can observe env state.
-                        unsafe {
-                            std::env::remove_var("BEYONDER_INITIAL_CMD");
-                        }
+        // Spawn the shell PTY exactly like a regular tab. For editor-only
+        // mode we just preload `exec <editor> <path>` into that shell —
+        // the shell loads its rc files (so PATH / XDG / aliases match a
+        // normal tab, where nvim+NvChad already work perfectly), then
+        // `exec` replaces it with the editor so when the editor exits
+        // the PTY exits and the popup window closes.
+        let shell_env = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = config.shell.program.as_deref().unwrap_or(&shell_env);
+        let pty = match PtySession::spawn_sized_with_wake(
+            session_id.clone(),
+            shell,
+            &cwd,
+            &[],
+            pty_cols,
+            pty_rows,
+            wake_fn,
+        ) {
+            Ok(mut p) => {
+                info!("Shell PTY spawned (editor_only={editor_only})");
+                // Figure out what initial command (if any) to preload.
+                let initial_line = if let Some(path) = editor_only_path {
+                    // Editor selection happens inside the shell, where rc
+                    // files have already populated PATH with Homebrew etc.
+                    // Don't trust the parent's BEYONDER_EDITOR — when the
+                    // parent was launched from .app, its PATH is the
+                    // launchd-minimal /usr/bin:/bin:..., so find_editor()
+                    // falls back to /usr/bin/vim even on machines with
+                    // /opt/homebrew/bin/nvim. Prefer nvim → vim → nano;
+                    // honour $VISUAL / $EDITOR if the shell has them.
+                    // SAFETY: set once at startup, cleared before async runs.
+                    unsafe {
+                        std::env::remove_var("BEYONDER_EDITOR");
                     }
-                    Some(p)
-                }
-                Err(e) => {
-                    warn!("Failed to spawn PTY: {e}");
+                    let p = shell_quote(&path);
+                    Some(format!(
+                        "E=${{VISUAL:-${{EDITOR:-}}}}; \
+                         if [ -n \"$E\" ] && command -v \"${{E%% *}}\" >/dev/null 2>&1; then eval exec \"$E\" {p}; \
+                         elif command -v nvim >/dev/null 2>&1; then exec nvim {p}; \
+                         elif command -v vim >/dev/null 2>&1; then exec vim {p}; \
+                         else exec nano {p}; fi\n"
+                    ))
+                } else if let Ok(cmd) = std::env::var("BEYONDER_INITIAL_CMD") {
+                    // SAFETY: same as above.
+                    unsafe {
+                        std::env::remove_var("BEYONDER_INITIAL_CMD");
+                    }
+                    if cmd.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("{}\n", cmd.trim_end_matches('\n')))
+                    }
+                } else {
                     None
+                };
+                if let Some(line) = initial_line {
+                    if let Err(e) = p.write(line.as_bytes()) {
+                        warn!("Failed to preload command into PTY: {e}");
+                    }
                 }
+                Some(p)
+            }
+            Err(e) => {
+                warn!("Failed to spawn PTY: {e}");
+                None
             }
         };
 
