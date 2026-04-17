@@ -201,7 +201,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "beyonder-acp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "beyonder-core",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "beyonder-core",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "beyonder-config",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-remote"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "beyonder-core",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "beyonder-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "beyondtty"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "beyonder-config",

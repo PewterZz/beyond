@@ -1,7 +1,7 @@
 class Beyondtty < Formula
   desc "AI-native terminal with block-oriented model and GPU-accelerated rendering"
   homepage "https://github.com/PewterZz/Beyond"
-  version "0.1.0"
+  version "0.1.1"
   license "GPL-3.0-or-later"
 
   on_macos do
