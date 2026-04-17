@@ -51,8 +51,10 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
     // `scheme:` where scheme isn't `file` belongs to the system handler.
     if let Some(colon) = url.find(':') {
         let scheme = &url[..colon];
-        let is_scheme =
-            !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+');
+        let is_scheme = !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+');
         if is_scheme && scheme != "file" {
             return None;
         }
