@@ -3187,6 +3187,18 @@ impl App {
         use beyonder_core::{
             BlockContent, BlockId, BlockKind, BlockStatus, MessageRole, ProvenanceChain,
         };
+        // Idempotent: if a Running Agent block for this agent already exists, reuse it.
+        // Multiple tool results fire push_pending_agent_block back-to-back; without this
+        // guard each one would leave behind an orphan Running Agent block, and since
+        // finalize_agent_block only rpositions the last one, the earlier orphans would
+        // render a hanging spinner forever.
+        if self.blocks.iter().any(|b| {
+            matches!(b.kind, BlockKind::Agent)
+                && matches!(b.status, BlockStatus::Running)
+                && b.agent_id.as_ref() == Some(&agent_id)
+        }) {
+            return;
+        }
         let now = chrono::Utc::now();
         let block = Block {
             id: BlockId::new(),
@@ -3803,7 +3815,7 @@ impl App {
                 self.append_agent_text(agent_id, &text);
             }
             AgentEvent::ToolCallRequested { id, name, input } => {
-                info!(tool = %name, "Agent tool call requested");
+                info!(tool = %name, tool_use_id = %id, "Agent tool call requested");
                 self.agent_running_tool
                     .insert(agent_id.clone(), name.clone());
                 self.finalize_agent_block(agent_id);
@@ -3815,6 +3827,7 @@ impl App {
                 output,
                 is_error,
             } => {
+                info!(tool_use_id = %id, is_error, output_len = output.len(), "ui: tool result received");
                 self.complete_tool_call_block(&id, output, is_error);
                 self.push_pending_agent_block(agent_id.clone());
             }
@@ -3883,17 +3896,23 @@ impl App {
     }
 
     fn finalize_agent_block(&mut self, agent_id: &beyonder_core::AgentId) {
+        // Only finalize Agent-kind message blocks — without this, successive
+        // ToolCallRequested events would finalize the PREVIOUS tool block
+        // (also Running, same agent_id), leaving it with no output and making
+        // its spinner hang when the ToolResult arrives and can't match it.
         let found = {
             let n = self.blocks.len();
             if n > 0 {
                 let last = &self.blocks[n - 1];
                 if last.agent_id.as_ref() == Some(agent_id)
+                    && matches!(last.kind, BlockKind::Agent)
                     && matches!(last.status, BlockStatus::Running)
                 {
                     Some(n - 1)
                 } else {
                     self.blocks.iter().rposition(|b| {
                         b.agent_id.as_ref() == Some(agent_id)
+                            && matches!(b.kind, BlockKind::Agent)
                             && matches!(b.status, BlockStatus::Running)
                     })
                 }
@@ -3957,16 +3976,29 @@ impl App {
     }
 
     fn complete_tool_call_block(&mut self, tool_use_id: &str, output: String, is_error: bool) {
-        if let Some(block) = self.blocks.iter_mut().rev().find(|b| {
-            if let beyonder_core::BlockContent::ToolCall {
-                tool_use_id: tid, ..
-            } = &b.content
-            {
-                tid == tool_use_id
-            } else {
-                false
-            }
-        }) {
+        // First try exact id match among Running tool blocks. Fall back to the
+        // oldest Running tool block when providers emit colliding/empty ids
+        // (seen with some local llama.cpp/MLX builds): this lets N results
+        // consume N Running blocks in FIFO order instead of all updating the
+        // same (last) block and leaving earlier spinners hung forever.
+        let idx = self
+            .blocks
+            .iter()
+            .position(|b| {
+                matches!(b.status, BlockStatus::Running)
+                    && matches!(
+                        &b.content,
+                        beyonder_core::BlockContent::ToolCall { tool_use_id: tid, .. }
+                            if tid == tool_use_id
+                    )
+            })
+            .or_else(|| {
+                self.blocks.iter().position(|b| {
+                    matches!(b.status, BlockStatus::Running)
+                        && matches!(&b.content, beyonder_core::BlockContent::ToolCall { .. })
+                })
+            });
+        if let Some(block) = idx.map(|i| &mut self.blocks[i]) {
             if let beyonder_core::BlockContent::ToolCall {
                 output: out, error, ..
             } = &mut block.content

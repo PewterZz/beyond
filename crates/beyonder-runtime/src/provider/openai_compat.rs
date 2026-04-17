@@ -330,9 +330,17 @@ impl OpenAICompatBackend {
         let mut finalized: Vec<(String, String, serde_json::Value)> = vec![]; // (id, name, input)
         let mut assistant_tool_calls: Vec<OAIAssistantToolCall> = vec![];
 
-        for partial in partial_calls {
+        for (i, mut partial) in partial_calls.into_iter().enumerate() {
             if partial.name.is_empty() {
                 continue;
+            }
+            // Some local servers (llama.cpp, MLX) ship tool-call deltas without
+            // an `id`. Synthesize one so each call has a distinct id — otherwise
+            // multiple tool calls collide to the same id, the UI can't tell the
+            // spinners apart, and the server sees ambiguous tool_call_id in the
+            // follow-up tool-result messages.
+            if partial.id.is_empty() {
+                partial.id = format!("call_gen_{}_{}", self.messages.len(), i);
             }
             let input: serde_json::Value = match serde_json::from_str(&partial.arguments_buf) {
                 Ok(v) => v,
