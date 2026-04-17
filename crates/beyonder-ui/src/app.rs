@@ -186,16 +186,63 @@ fn binary_in_path(name: &str) -> bool {
     false
 }
 
+/// Run a command through the user's login+interactive shell so `.zshrc` /
+/// `.bash_profile` / nvm / conda init run.
+///
+/// Launch-environment differs by platform:
+/// - **macOS .app** (Finder/Spotlight/Dock): launchd gives a minimal env with
+///   no `CONDA_DEFAULT_ENV` and no nvm shims on `PATH`.
+/// - **Linux .desktop**: environment depends on the DE — GNOME/KDE usually
+///   inherit from the user session (which sources `~/.profile`), while
+///   tiling WMs like sway/i3 may not. Going through the shell is consistent.
+/// - **Windows**: `SHELL` is normally unset; this probe returns `None` and
+///   the caller falls back to its "—" placeholder (no crash).
+fn shell_probe(cmd: &str) -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+    let shell = std::env::var("SHELL").ok()?;
+    let shell_name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    // fish doesn't accept `-l` as the login-shell flag (it uses `--login`
+    // as a long option only), so drop it for fish. Every other common
+    // POSIX-ish shell (bash/zsh/sh/dash/ash/ksh/tcsh) handles `-ilc`.
+    let args: &[&str] = if shell_name == "fish" {
+        &["-i", "-c", cmd]
+    } else {
+        &["-ilc", cmd]
+    };
+    let out = std::process::Command::new(&shell).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 fn current_conda_env() -> String {
-    std::env::var("CONDA_DEFAULT_ENV").unwrap_or_else(|_| "—".to_string())
+    if let Ok(v) = std::env::var("CONDA_DEFAULT_ENV") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // Portable across bash/zsh/sh/fish — all treat unset vars as empty
+    // inside a double-quoted string, and our caller trims the trailing newline.
+    shell_probe("echo \"$CONDA_DEFAULT_ENV\"").unwrap_or_else(|| "—".to_string())
 }
 
 fn current_node_version() -> String {
-    let output = std::process::Command::new("node").arg("--version").output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => "—".to_string(),
+    if let Ok(o) = std::process::Command::new("node").arg("--version").output() {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
     }
+    shell_probe("node --version 2>/dev/null").unwrap_or_else(|| "—".to_string())
 }
 
 fn fetch_conda_envs() -> Vec<String> {

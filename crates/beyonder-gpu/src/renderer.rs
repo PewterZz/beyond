@@ -5,7 +5,7 @@ use beyonder_core::{Block, BlockContent, BlockKind, BlockStatus, TuiCell, Underl
 use glyphon::{
     Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphColor, ColorMode, Cursor as TextCursor,
     Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
-    TextRenderer, Viewport as GlyphViewport,
+    TextRenderer, Viewport as GlyphViewport, Wrap,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -206,6 +206,9 @@ pub struct Renderer {
 
     /// Active agent model name — shown as a pill in the top-right of the input bar.
     pub agent_model: String,
+    /// Model pill rect — set during append_bar_rects so build_bar_text_buffers
+    /// can read the measured width instead of recomputing.
+    pub model_pill_rect: [f32; 4],
 
     /// GlyphBuffer cache: block_id → (content_len, buf_w_bits, font_bits, viewport_h_bits, last_frame, buffer).
     /// Re-shaping is skipped when content and layout params are unchanged.
@@ -499,6 +502,7 @@ impl Renderer {
             approval_mode_label: "bypass".to_string(),
             approval_mode_pill_rect: [0.0; 4],
             agent_model: String::new(),
+            model_pill_rect: [0.0; 4],
             glyph_buf_cache: HashMap::new(),
             frame_counter: 0,
             block_heights: vec![],
@@ -2126,16 +2130,12 @@ impl Renderer {
             [b[0], b[1], b[2], 0.5],
         ));
 
-        // Context pills.
+        // Context pills. Width is derived from the actually shaped text
+        // (no char-width heuristic) so the rect edge matches the glyphs on
+        // every platform, regardless of which fallback font the system picks.
         let pill_hpad = 12.0 * sc;
         let pill_gap = 8.0 * sc;
-        // Char width estimate for text at pill_font_size (= phys_font * 0.75).
-        // Bumped from 0.6 to 0.7 so the last glyph doesn't clip when the font
-        // falls back from JetBrains Mono Nerd Font (especially on Linux).
-        let pill_char_w = phys_font * 0.7 * 0.75;
-        // Nerd Font icons are drawn near full-em (~1.0x) rather than 0.7x,
-        // so reserve extra space per pill to fit the leading icon glyph.
-        let pill_icon_slack = phys_font * 0.75 * 0.5;
+        let pill_font_size = phys_font * 0.75;
         let pill_h = 22.0 * sc;
         let pill_top = bar_y + 14.0 * sc;
         let pill_bgs: [[f32; 4]; 3] = [
@@ -2149,14 +2149,15 @@ impl Renderer {
             [0.706, 0.745, 0.996, 0.75],
         ];
         let pill_icons = ['\u{e73c}', '\u{e718}', '\u{f07c}'];
+        let measure_color = gc(self.theme.text);
         let mut new_pill_rects: Vec<[f32; 4]> = Vec::new();
         let mut pill_x = 14.0 * sc;
         let pills = self.context_pills.clone();
         for (i, label) in pills.iter().enumerate() {
             let icon = pill_icons.get(i).copied().unwrap_or(' ');
             let full_label = format!("{} {}", icon, label);
-            let pill_w =
-                full_label.chars().count() as f32 * pill_char_w + pill_icon_slack + 2.0 * pill_hpad;
+            let (_, text_w) = self.make_pill_buffer(&full_label, pill_font_size, measure_color);
+            let pill_w = text_w + 2.0 * pill_hpad;
             let bg = pill_bgs
                 .get(i)
                 .copied()
@@ -2179,8 +2180,9 @@ impl Renderer {
         if !self.agent_model.is_empty() {
             let model_label = format!("\u{f135}  {}", self.agent_model); // rocket icon
             let model_font = phys_font * 0.75;
-            let model_char_w = model_font * 0.6;
-            let model_w = model_label.chars().count() as f32 * model_char_w + 2.0 * pill_hpad;
+            let (_, model_text_w) =
+                self.make_pill_buffer(&model_label, model_font, measure_color);
+            let model_w = model_text_w + 2.0 * pill_hpad;
             let model_x = win_w - model_w - 14.0 * sc;
             rects.push(
                 RectInstance::filled(
@@ -2193,16 +2195,17 @@ impl Renderer {
                 .with_radius(4.0)
                 .with_border(1.0, [0.722, 0.561, 0.957, 0.7]),
             );
+            self.model_pill_rect = [model_x, pill_top, model_w, pill_h];
+        } else {
+            self.model_pill_rect = [0.0; 4];
         }
 
         // Mode switcher pill.
         {
-            // Text-only pills (no icon): font is phys_font * 0.75, so char width
-            // is ~0.6x that. Bump to 0.7x so the last glyph doesn't clip when
-            // the Nerd Font family falls back on Linux.
-            let mode_char_w = phys_font * 0.75 * 0.7;
+            let mode_font = phys_font * 0.75;
             let mode_text = self.mode_label.clone();
-            let mode_w = mode_text.chars().count() as f32 * mode_char_w + 2.0 * pill_hpad;
+            let (_, mode_text_w) = self.make_pill_buffer(&mode_text, mode_font, measure_color);
+            let mode_w = mode_text_w + 2.0 * pill_hpad;
             let mode_h = 20.0 * sc;
             let mode_x = 14.0 * sc;
             let mode_y = bar_y + bar_h - mode_h - 8.0 * sc;
@@ -2225,7 +2228,9 @@ impl Renderer {
 
             // Approval-mode pill — sits immediately right of the mode pill.
             let approval_text = self.approval_mode_label.clone();
-            let approval_w = approval_text.chars().count() as f32 * mode_char_w + 2.0 * pill_hpad;
+            let (_, approval_text_w) =
+                self.make_pill_buffer(&approval_text, mode_font, measure_color);
+            let approval_w = approval_text_w + 2.0 * pill_hpad;
             let approval_gap = 6.0 * sc;
             let approval_x = mode_x + mode_w + approval_gap;
             let (approval_bg, approval_border) = match approval_text.as_str() {
@@ -3126,74 +3131,61 @@ impl Renderer {
             let _ = preedit_active;
         }
 
-        // Pill text — one entry per pill. Keep these constants in lockstep
-        // with append_bar_rects so the rect and the shaped text share geometry.
-        let pill_top = bar_y + 14.0 * sc;
-        let pill_h = 22.0 * sc;
+        // Pill text — one entry per pill. Widths come from the rects computed
+        // in append_bar_rects (which shaped each label naturally), so the
+        // shaped text here always fits within the pill's padded interior.
         let pill_hpad = 12.0 * sc;
-        let pill_gap = 8.0 * sc;
-        let pill_char_w = phys_font * 0.7 * 0.75;
-        let pill_icon_slack = phys_font * 0.75 * 0.5;
         let pill_font_size = phys_font * 0.75;
         let pill_line_h = pill_font_size * 1.4;
-        let pill_text_y = pill_top + (pill_h - pill_line_h) * 0.5;
         let pill_icons = ['\u{e73c}', '\u{e718}', '\u{f07c}'];
         let pill_text_colors = [
             gc(self.theme.yellow),
             gc(self.theme.green),
             gc(self.theme.lavender),
         ];
+        let pill_rects_snapshot = self.pill_rects.clone();
         let pills = self.context_pills.clone();
-        let mut pill_x = 14.0 * sc;
         for (i, label) in pills.iter().enumerate() {
+            let Some(&[rx, ry, rw, rh]) = pill_rects_snapshot.get(i) else {
+                continue;
+            };
             let icon = pill_icons.get(i).copied().unwrap_or(' ');
             let full_label = format!("{} {}", icon, label);
-            let pill_w =
-                full_label.chars().count() as f32 * pill_char_w + pill_icon_slack + 2.0 * pill_hpad;
             let color = pill_text_colors
                 .get(i)
                 .copied()
                 .unwrap_or(gc(self.theme.subtext));
-            let pill_buf =
-                self.make_pill_buffer(&full_label, pill_w - 2.0 * pill_hpad, pill_font_size, color);
+            let (pill_buf, _) = self.make_pill_buffer(&full_label, pill_font_size, color);
+            let ty = ry + (rh - pill_line_h) * 0.5;
             results.push((
                 pill_buf,
-                pill_x + pill_hpad,
-                pill_text_y,
-                pill_w - 2.0 * pill_hpad,
+                rx + pill_hpad,
+                ty,
+                (rw - 2.0 * pill_hpad).max(1.0),
                 pill_line_h,
                 color,
             ));
-            pill_x += pill_w + pill_gap;
         }
 
         // Model name pill text — top-right.
         if !self.agent_model.is_empty() {
-            let model_label = format!("\u{f135}  {}", self.agent_model);
-            let model_font = phys_font * 0.75;
-            let model_char_w = model_font * 0.6;
-            let pill_hpad = 12.0 * sc;
-            let model_w = model_label.chars().count() as f32 * model_char_w + 2.0 * pill_hpad;
-            let model_x = win_w - model_w - 14.0 * sc;
-            let pill_top = bar_y + 14.0 * sc;
-            let pill_h = 22.0 * sc;
-            let model_line_h = model_font * 1.4;
-            let model_ty = pill_top + (pill_h - model_line_h) * 0.5;
-            let model_color = gc(self.theme.mauve);
-            let model_buf = self.make_pill_buffer(
-                &model_label,
-                model_w - 2.0 * pill_hpad,
-                model_font,
-                model_color,
-            );
-            results.push((
-                model_buf,
-                model_x + pill_hpad,
-                model_ty,
-                model_w - 2.0 * pill_hpad,
-                model_line_h,
-                model_color,
-            ));
+            let [rx, ry, rw, rh] = self.model_pill_rect;
+            if rw > 0.0 {
+                let model_label = format!("\u{f135}  {}", self.agent_model);
+                let model_font = phys_font * 0.75;
+                let model_line_h = model_font * 1.4;
+                let model_color = gc(self.theme.mauve);
+                let (model_buf, _) = self.make_pill_buffer(&model_label, model_font, model_color);
+                let model_ty = ry + (rh - model_line_h) * 0.5;
+                results.push((
+                    model_buf,
+                    rx + pill_hpad,
+                    model_ty,
+                    (rw - 2.0 * pill_hpad).max(1.0),
+                    model_line_h,
+                    model_color,
+                ));
+            }
         }
 
         // Mode switcher text.
@@ -3208,15 +3200,13 @@ impl Renderer {
                     "agent" => gc(self.theme.mauve),
                     _ => gc(self.theme.muted),
                 };
-                let hpad = 12.0 * sc;
-                let mode_buf =
-                    self.make_pill_buffer(&mode_text, mode_w - 2.0 * hpad, mode_font, mode_color);
+                let (mode_buf, _) = self.make_pill_buffer(&mode_text, mode_font, mode_color);
                 let ty = mode_y + (mode_h - mode_line_h) * 0.5;
                 results.push((
                     mode_buf,
-                    mode_x + hpad,
+                    mode_x + pill_hpad,
                     ty,
-                    mode_w - 2.0 * hpad,
+                    (mode_w - 2.0 * pill_hpad).max(1.0),
                     mode_line_h,
                     mode_color,
                 ));
@@ -3235,19 +3225,13 @@ impl Renderer {
                     "auto" => gc(self.theme.green),
                     _ => gc(self.theme.muted),
                 };
-                let hpad = 12.0 * sc;
-                let buf = self.make_pill_buffer(
-                    &approval_text,
-                    aw - 2.0 * hpad,
-                    approval_font,
-                    approval_color,
-                );
+                let (buf, _) = self.make_pill_buffer(&approval_text, approval_font, approval_color);
                 let ty = ay + (ah - approval_line_h) * 0.5;
                 results.push((
                     buf,
-                    ax + hpad,
+                    ax + pill_hpad,
                     ty,
-                    aw - 2.0 * hpad,
+                    (aw - 2.0 * pill_hpad).max(1.0),
                     approval_line_h,
                     approval_color,
                 ));
@@ -3409,22 +3393,27 @@ impl Renderer {
                 gc(self.theme.muted)
             };
             let ty = ry + (rh - line_h) * 0.5;
-            let buf =
-                self.make_pill_buffer(label, (rw - inner_pad * 2.0).max(1.0), phys_font, color);
+            let (buf, _) = self.make_pill_buffer(label, phys_font, color);
             results.push((buf, rx + inner_pad, ty, rw - inner_pad * 2.0, line_h, color));
         }
     }
 
+    /// Shape a pill label naturally (no wrap) and return the buffer + its
+    /// measured width. Use this for both sizing the pill's background rect
+    /// (so the right edge hugs the text) and for layout in the text pass —
+    /// that way rect and glyphs always agree, regardless of font fallback
+    /// (Linux often falls back from JetBrainsMono Nerd Font and glyph widths
+    /// don't match the old formula-based estimate).
     fn make_pill_buffer(
         &mut self,
         text: &str,
-        max_width: f32,
         size: f32,
         color: GlyphColor,
-    ) -> GlyphBuffer {
+    ) -> (GlyphBuffer, f32) {
         let metrics = Metrics::new(size, size * 1.4);
         let mut buf = GlyphBuffer::new(&mut self.font_system, metrics);
-        buf.set_size(&mut self.font_system, Some(max_width), None);
+        buf.set_size(&mut self.font_system, None, None);
+        buf.set_wrap(&mut self.font_system, Wrap::None);
         buf.set_text(
             &mut self.font_system,
             text,
@@ -3434,7 +3423,11 @@ impl Renderer {
             Shaping::Advanced,
         );
         buf.shape_until_scroll(&mut self.font_system, false);
-        buf
+        let measured = buf
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
+        (buf, measured)
     }
 
     fn make_buffer(
