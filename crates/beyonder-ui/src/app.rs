@@ -721,8 +721,13 @@ impl App {
     ) -> Result<Self> {
         let mut renderer = Renderer::new(Arc::clone(&window)).await?;
         renderer.set_theme(config.resolved_theme());
-        // Enable IME so winit delivers WindowEvent::Ime (preedit/commit) events.
-        window.set_ime_allowed(true);
+        // IME off by default — on macOS every keystroke otherwise routes through
+        // NSTextInputContext, adding a frame of latency even for ASCII. Opt-in via
+        // `BEYONDER_IME=1` for users who need CJK/emoji input via preedit.
+        let ime_enabled = std::env::var("BEYONDER_IME")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        window.set_ime_allowed(ime_enabled);
 
         // Open data store.
         std::fs::create_dir_all(&config.data_dir)?;
@@ -3322,13 +3327,27 @@ impl App {
             had_work = true;
         }
 
-        // Drain PTY events.
+        // Drain PTY events — cap bytes processed per tick so huge bursts
+        // (closing an alt-screen TUI, `fly deploy` spam, `cat large_file`) can't
+        // monopolise the UI thread. Any remainder stays in the channel and is
+        // picked up next tick — had_work=true keeps the loop in Poll mode so
+        // there's no visible delay, just no beachball.
+        const MAX_PTY_BYTES_PER_TICK: usize = 256 * 1024;
         let mut pty_output: Vec<Vec<u8>> = vec![];
         let mut pty_exited: Option<Option<u32>> = None;
+        let mut pty_drain_capped = false;
         if let Some(pty) = &mut self.pty {
+            let mut bytes_drained = 0usize;
             while let Ok(event) = pty.event_rx.try_recv() {
                 match event {
-                    PtyEvent::Output(bytes) => pty_output.push(bytes),
+                    PtyEvent::Output(bytes) => {
+                        bytes_drained += bytes.len();
+                        pty_output.push(bytes);
+                        if bytes_drained >= MAX_PTY_BYTES_PER_TICK {
+                            pty_drain_capped = true;
+                            break;
+                        }
+                    }
                     PtyEvent::Exited(code) => {
                         info!("Shell exited: {:?}", code);
                         pty_exited = Some(code);
@@ -3662,7 +3681,10 @@ impl App {
             }
         }
 
-        had_work
+        // If we bailed out of the PTY drain early, force another wake so the
+        // remainder is processed on the very next iteration rather than waiting
+        // for a keystroke / timer to kick the loop.
+        had_work || pty_drain_capped
     }
 
     fn handle_build_event(&mut self, event: BuildEvent) {
