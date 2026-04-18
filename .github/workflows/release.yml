@@ -52,7 +52,7 @@ jobs:
           tar czf ../../../beyondtty-${{ github.ref_name }}-${{ matrix.target }}.tar.gz beyondtty beyonder
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: beyondtty-${{ matrix.target }}
           path: beyondtty-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
