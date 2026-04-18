@@ -219,6 +219,12 @@ pub struct Renderer {
     /// `last_frame` tracks the frame number when this entry was last used, for LRU eviction.
     #[allow(clippy::type_complexity)]
     glyph_buf_cache: HashMap<beyonder_core::BlockId, (u64, u32, u32, u32, u32, u64, GlyphBuffer)>,
+    /// Wall-clock of the last markdown re-shape per block. Used to throttle re-shapes
+    /// for streaming (Running) agent blocks: a per-token cache invalidation re-shapes
+    /// ~110 lines per delta and easily blows the 16ms frame budget. Capping to one
+    /// re-shape per RUNNING_RESHAPE_MIN_MS gives a smoother stream at the cost of
+    /// rendering text in slightly larger visual chunks.
+    running_shape_at: HashMap<beyonder_core::BlockId, Instant>,
     /// Monotonic frame counter — incremented each render(). Used for LRU eviction.
     frame_counter: u64,
 
@@ -510,6 +516,7 @@ impl Renderer {
             agent_model: String::new(),
             model_pill_rect: [0.0; 4],
             glyph_buf_cache: HashMap::new(),
+            running_shape_at: HashMap::new(),
             frame_counter: 0,
             block_heights: vec![],
             block_fingerprints: vec![],
@@ -2909,12 +2916,27 @@ impl Renderer {
                                             total_lines,
                                             phys_font,
                                         );
+                                        // Streaming throttle: while the block is Running we re-shape at most
+                                        // once per RUNNING_RESHAPE_MIN_MS so per-token deltas don't blow the
+                                        // 16ms frame budget on a 100-line markdown shape.
+                                        const RUNNING_RESHAPE_MIN_MS: u128 = 60;
+                                        let is_streaming =
+                                            matches!(block.status, BlockStatus::Running);
+                                        let throttle_ok = is_streaming
+                                            && self
+                                                .running_shape_at
+                                                .get(&block.id)
+                                                .is_some_and(|t| {
+                                                    t.elapsed().as_millis() < RUNNING_RESHAPE_MIN_MS
+                                                });
                                         // Reuse cache if content+layout match AND the cached
                                         // shape window still covers the viewport-visible slice.
+                                        // `served_len` is what we re-key the cache with so a
+                                        // throttle-hit doesn't latch the stale len permanently.
                                         let cached = self.glyph_buf_cache.remove(&block.id);
-                                        let (buf, shape_start) = match cached {
+                                        let (buf, shape_start, served_len) = match cached {
                                             Some((len, bw, pf, vh, cached_start, _frame, b))
-                                                if len == content_len
+                                                if (len == content_len || throttle_ok)
                                                     && bw == bw_bits
                                                     && pf == pf_bits
                                                     && vh == vh_bits
@@ -2926,7 +2948,7 @@ impl Renderer {
                                                         phys_font,
                                                     ) =>
                                             {
-                                                (b, cached_start as usize)
+                                                (b, cached_start as usize, len)
                                             }
                                             _ => {
                                                 let b = self.make_markdown_buffer(
@@ -2936,7 +2958,11 @@ impl Renderer {
                                                     new_start,
                                                     shape_len,
                                                 );
-                                                (b, new_start)
+                                                if is_streaming {
+                                                    self.running_shape_at
+                                                        .insert(block.id.clone(), Instant::now());
+                                                }
+                                                (b, new_start, content_len)
                                             }
                                         };
                                         // Offset text_y down by the skipped lines so the
@@ -2954,7 +2980,7 @@ impl Renderer {
                                             ),
                                             (
                                                 block.id.clone(),
-                                                content_len,
+                                                served_len,
                                                 bw_bits,
                                                 pf_bits,
                                                 vh_bits,
