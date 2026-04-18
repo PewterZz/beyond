@@ -1878,22 +1878,23 @@ impl App {
             .await
             .resolve_approval(block_id, decision);
 
-        if let Some(block) = self.blocks.iter_mut().find(|b| b.id.0 == block_id) {
-            if let BlockContent::ApprovalRequest {
-                granted: g,
-                granter,
-                ..
-            } = &mut block.content
-            {
-                *g = Some(granted);
-                *granter = Some(beyonder_core::ActorId::Human);
+        // Remove the approval block from the stream — visual confirmation isn't
+        // needed (the next agent action speaks for itself; on deny the agent stops).
+        let agent_id = self
+            .blocks
+            .iter()
+            .find(|b| b.id.0 == block_id)
+            .and_then(|b| b.agent_id.clone());
+        self.blocks.retain(|b| b.id.0 != block_id);
+        self.blocks_dirty = true;
+
+        if !granted {
+            if let Some(id) = agent_id {
+                if let Err(e) = self.supervisor.kill_agent(&id).await {
+                    error!("kill_agent on deny failed: {e}");
+                }
+                self.agent_running_tool.remove(&id);
             }
-            block.status = if granted {
-                BlockStatus::Completed
-            } else {
-                BlockStatus::Failed
-            };
-            self.blocks_dirty = true;
         }
     }
 

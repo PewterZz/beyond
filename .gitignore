@@ -1,4 +1,5 @@
 /target
 .claude/worktrees
+.claude/scheduled_tasks.lock
 *.swp
 .DS_Store
