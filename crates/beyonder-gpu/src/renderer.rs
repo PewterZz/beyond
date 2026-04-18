@@ -210,10 +210,12 @@ pub struct Renderer {
     /// can read the measured width instead of recomputing.
     pub model_pill_rect: [f32; 4],
 
-    /// GlyphBuffer cache: block_id → (content_len, buf_w_bits, font_bits, viewport_h_bits, last_frame, buffer).
-    /// Re-shaping is skipped when content and layout params are unchanged.
+    /// GlyphBuffer cache: block_id → (content_len, buf_w_bits, font_bits, viewport_h_bits, shape_start_line, last_frame, buffer).
+    /// Re-shaping is skipped when content and layout params are unchanged and the cached shape window still covers the viewport.
+    /// `shape_start_line` is the first text-line index shaped into the buffer (tail of the document when content exceeds the shape window).
     /// `last_frame` tracks the frame number when this entry was last used, for LRU eviction.
-    glyph_buf_cache: HashMap<beyonder_core::BlockId, (u64, u32, u32, u32, u64, GlyphBuffer)>,
+    #[allow(clippy::type_complexity)]
+    glyph_buf_cache: HashMap<beyonder_core::BlockId, (u64, u32, u32, u32, u32, u64, GlyphBuffer)>,
     /// Monotonic frame counter — incremented each render(). Used for LRU eviction.
     frame_counter: u64,
 
@@ -283,9 +285,9 @@ pub struct QrBitmap {
 /// after `TextRenderer::prepare()` consumes the TextArea borrows.
 struct TextBufList {
     entries: Vec<(GlyphBuffer, f32, f32, f32, f32, GlyphColor)>,
-    /// (block_id, content_len, buf_w_bits, pf_bits, viewport_h_bits)
+    /// (block_id, content_len, buf_w_bits, pf_bits, viewport_h_bits, shape_start_line)
     #[allow(clippy::type_complexity)]
-    keys: Vec<Option<(beyonder_core::BlockId, u64, u32, u32, u32)>>,
+    keys: Vec<Option<(beyonder_core::BlockId, u64, u32, u32, u32, u32)>>,
     /// Per-entry explicit clip rect override (clip_top, clip_bottom). When Some,
     /// overrides the default derivation from (y, y+h). Used for scrolled buffers
     /// where TextArea.top is shifted but the visible clip window differs.
@@ -323,7 +325,7 @@ impl TextBufList {
     fn push_cached(
         &mut self,
         entry: (GlyphBuffer, f32, f32, f32, f32, GlyphColor),
-        key: (beyonder_core::BlockId, u64, u32, u32, u32),
+        key: (beyonder_core::BlockId, u64, u32, u32, u32, u32),
     ) {
         self.entries.push(entry);
         self.keys.push(Some(key));
@@ -779,30 +781,54 @@ impl Renderer {
         let pf_bits = phys_font.to_bits();
         let vh_bits = self.viewport.height.to_bits();
         let fc = self.frame_counter;
-        let cached_matches = self
+        let total_lines = content_text.lines().count();
+        let (fallback_start, shape_len) = if is_markdown {
+            self.markdown_shape_params(block_idx, total_lines, phys_font)
+        } else {
+            (0, 0)
+        };
+        let cached_ok = self
             .glyph_buf_cache
             .get(&block.id)
-            .map(|(l, b, p, v, _, _)| {
-                *l == content_len && *b == bw_bits && *p == pf_bits && *v == vh_bits
+            .map(|(l, b, p, v, ss, _, _)| {
+                *l == content_len
+                    && *b == bw_bits
+                    && *p == pf_bits
+                    && *v == vh_bits
+                    && (!is_markdown
+                        || self.markdown_shape_covers(
+                            block_idx,
+                            *ss as usize,
+                            shape_len,
+                            total_lines,
+                            phys_font,
+                        ))
             })
             .unwrap_or(false);
-        if !cached_matches {
-            let buf = if is_markdown {
-                self.make_markdown_buffer(&content_text, buf_w, phys_font).0
+        if !cached_ok {
+            let (buf, shape_start) = if is_markdown {
+                let b = self.make_markdown_buffer(
+                    &content_text,
+                    buf_w,
+                    phys_font,
+                    fallback_start,
+                    shape_len,
+                );
+                (b, fallback_start as u32)
             } else {
-                self.make_buffer(&content_text, buf_w, phys_font, gc(self.theme.text))
+                let b = self.make_buffer(&content_text, buf_w, phys_font, gc(self.theme.text));
+                (b, 0u32)
             };
             self.glyph_buf_cache.insert(
                 block.id.clone(),
-                (content_len, bw_bits, pf_bits, vh_bits, fc, buf),
+                (content_len, bw_bits, pf_bits, vh_bits, shape_start, fc, buf),
             );
         } else if let Some(entry) = self.glyph_buf_cache.get_mut(&block.id) {
-            entry.4 = fc; // touch LRU
+            entry.5 = fc; // touch LRU
         }
-        let (_, _, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
+        let (_, _, _, _, cached_start, _, buf) = self.glyph_buf_cache.get(&block.id)?;
         let skipped = if is_markdown {
-            let max_vis = ((self.viewport.height / line_h).ceil() as usize + 30).max(50);
-            content_text.lines().count().saturating_sub(max_vis)
+            *cached_start as usize
         } else {
             0
         };
@@ -1052,7 +1078,7 @@ impl Renderer {
                 if (s.line, s.index) == (e.line, e.index) {
                     return None;
                 }
-                let (_, _, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
+                let (_, _, _, _, _, _, buf) = self.glyph_buf_cache.get(&block.id)?;
                 let mut out = String::new();
                 let last = buf.lines.len().saturating_sub(1);
                 let s_line = s.line.min(last);
@@ -1560,8 +1586,9 @@ impl Renderer {
         // text_areas was consumed by prepare() so buf_list.entries is free to move.
         let fc = self.frame_counter;
         for ((buf, ..), key) in buf_list.entries.into_iter().zip(buf_list.keys) {
-            if let Some((id, len, bw, pf, vh)) = key {
-                self.glyph_buf_cache.insert(id, (len, bw, pf, vh, fc, buf));
+            if let Some((id, len, bw, pf, vh, ss)) = key {
+                self.glyph_buf_cache
+                    .insert(id, (len, bw, pf, vh, ss, fc, buf));
             }
         }
 
@@ -1610,7 +1637,7 @@ impl Renderer {
         let fc = self.frame_counter;
         if self.glyph_buf_cache.len() > MAX_CACHE || fc.is_multiple_of(60) {
             self.glyph_buf_cache
-                .retain(|_, (_, _, _, _, last, _)| fc.saturating_sub(*last) < EVICT_AGE);
+                .retain(|_, (_, _, _, _, _, last, _)| fc.saturating_sub(*last) < EVICT_AGE);
         }
 
         Ok(())
@@ -2027,7 +2054,7 @@ impl Renderer {
                             cursor,
                         } if *block_idx == i => {
                             if let Some((x_content, text_y, _buf_w)) = self.agent_buffer_geom(i) {
-                                if let Some((_, _, _, _, _, buf)) =
+                                if let Some((_, _, _, _, cached_start, _, buf)) =
                                     self.glyph_buf_cache.get(&block.id)
                                 {
                                     let (s, e) = order_cur(*anchor, *cursor);
@@ -2035,14 +2062,7 @@ impl Renderer {
                                     let phys_font_local = self.font_size * sc;
                                     let line_h = phys_font_local * 1.4;
                                     let skipped = match &block.content {
-                                        BlockContent::AgentMessage { .. } => {
-                                            let total = block_content_text(block).lines().count();
-                                            let max_vis = ((self.viewport.height / line_h).ceil()
-                                                as usize
-                                                + 30)
-                                                .max(50);
-                                            total.saturating_sub(max_vis)
-                                        }
+                                        BlockContent::AgentMessage { .. } => *cached_start as usize,
                                         _ => 0,
                                     };
                                     let adjusted_text_y = text_y + skipped as f32 * line_h;
@@ -2875,38 +2895,46 @@ impl Renderer {
                                     let pf_bits = phys_font.to_bits();
                                     let vh_bits = self.viewport.height.to_bits();
                                     if is_agent && !is_user_msg {
-                                        // Try to reuse a previously shaped markdown buffer.
+                                        let total_lines = content_text.lines().count();
+                                        let (new_start, shape_len) = self.markdown_shape_params(
+                                            block_idx,
+                                            total_lines,
+                                            phys_font,
+                                        );
+                                        // Reuse cache if content+layout match AND the cached
+                                        // shape window still covers the viewport-visible slice.
                                         let cached = self.glyph_buf_cache.remove(&block.id);
-                                        let (buf, skipped, cache_len) = match cached {
-                                            Some((len, bw, pf, vh, _frame, b))
+                                        let (buf, shape_start) = match cached {
+                                            Some((len, bw, pf, vh, cached_start, _frame, b))
                                                 if len == content_len
                                                     && bw == bw_bits
                                                     && pf == pf_bits
-                                                    && vh == vh_bits =>
+                                                    && vh == vh_bits
+                                                    && self.markdown_shape_covers(
+                                                        block_idx,
+                                                        cached_start as usize,
+                                                        shape_len,
+                                                        total_lines,
+                                                        phys_font,
+                                                    ) =>
                                             {
-                                                // Content unchanged — reuse shaped buffer as-is.
-                                                let line_h = phys_font * 1.4;
-                                                let max_vis = ((self.viewport.height / line_h)
-                                                    .ceil()
-                                                    as usize
-                                                    + 30)
-                                                    .max(50);
-                                                let total = content_text.lines().count();
-                                                (b, total.saturating_sub(max_vis), len)
+                                                (b, cached_start as usize)
                                             }
                                             _ => {
-                                                let (b, s) = self.make_markdown_buffer(
+                                                let b = self.make_markdown_buffer(
                                                     &content_text,
                                                     buf_w,
                                                     phys_font,
+                                                    new_start,
+                                                    shape_len,
                                                 );
-                                                (b, s, content_len)
+                                                (b, new_start)
                                             }
                                         };
                                         // Offset text_y down by the skipped lines so the
-                                        // visible tail renders at the correct screen position.
+                                        // shaped window lands at the correct screen position.
                                         let line_h = phys_font * 1.4;
-                                        let adjusted_text_y = text_y + skipped as f32 * line_h;
+                                        let adjusted_text_y = text_y + shape_start as f32 * line_h;
                                         results.push_cached(
                                             (
                                                 buf,
@@ -2918,10 +2946,11 @@ impl Renderer {
                                             ),
                                             (
                                                 block.id.clone(),
-                                                cache_len,
+                                                content_len,
                                                 bw_bits,
                                                 pf_bits,
                                                 vh_bits,
+                                                shape_start as u32,
                                             ),
                                         );
                                     } else {
@@ -3453,19 +3482,21 @@ impl Renderer {
         text: &str,
         max_width: f32,
         size: f32,
-    ) -> (GlyphBuffer, usize) {
+        shape_start_line: usize,
+        shape_len: usize,
+    ) -> GlyphBuffer {
         use glyphon::Weight;
 
-        let line_h = size * 1.4;
-        // Shape only the last viewport-height worth of lines + a small lookahead
-        // buffer so scrolling slightly above the visible area still looks correct.
-        let max_vis_lines = ((self.viewport.height / line_h).ceil() as usize + 30).max(50);
+        // Shape a `shape_len`-line window starting at `shape_start_line`.
+        // Caller offsets text_y by shape_start_line * line_h so the window sits
+        // in the correct screen position. Outside this window the buffer is
+        // empty, so callers must slide the window before the viewport leaves it.
         let all_lines: Vec<&str> = text.lines().collect();
         let total_lines = all_lines.len();
-        let skipped_lines = total_lines.saturating_sub(max_vis_lines);
-        // Work on the visible tail only.
-        let visible_text: std::borrow::Cow<str> = if skipped_lines > 0 {
-            std::borrow::Cow::Owned(all_lines[skipped_lines..].join("\n"))
+        let start = shape_start_line.min(total_lines);
+        let end = start.saturating_add(shape_len).min(total_lines);
+        let visible_text: std::borrow::Cow<str> = if start > 0 || end < total_lines {
+            std::borrow::Cow::Owned(all_lines[start..end].join("\n"))
         } else {
             std::borrow::Cow::Borrowed(text)
         };
@@ -3549,7 +3580,51 @@ impl Renderer {
             Shaping::Advanced,
         );
         buf.shape_until_scroll(&mut self.font_system, false);
-        (buf, skipped_lines)
+        buf
+    }
+
+    /// Compute the markdown shape window (start_line, len) for an AgentMessage
+    /// block so it covers the viewport-visible slice of the block plus a
+    /// hysteresis margin. Used by the render path when the cache misses or the
+    /// previously cached window no longer covers the viewport.
+    fn markdown_shape_params(
+        &self,
+        block_idx: usize,
+        total_lines: usize,
+        phys_font: f32,
+    ) -> (usize, usize) {
+        let sc = self.scale_factor;
+        let line_h = phys_font * 1.4;
+        const MARGIN: usize = 30;
+        let viewport_lines = (self.viewport.height / line_h).ceil() as usize;
+        let shape_len = (viewport_lines + 2 * MARGIN).max(50);
+        let text_top = self.block_y_prefix.get(block_idx).copied().unwrap_or(0.0) + 4.0 * sc;
+        let first_visible =
+            ((self.viewport.scroll_offset - text_top).max(0.0) / line_h).floor() as usize;
+        let max_start = total_lines.saturating_sub(shape_len);
+        let start = first_visible.saturating_sub(MARGIN).min(max_start);
+        (start, shape_len)
+    }
+
+    /// True when a cached buffer's shape window still contains the viewport's
+    /// visible slice of this block. When false the render path must re-shape.
+    fn markdown_shape_covers(
+        &self,
+        block_idx: usize,
+        cached_start: usize,
+        shape_len: usize,
+        total_lines: usize,
+        phys_font: f32,
+    ) -> bool {
+        let sc = self.scale_factor;
+        let line_h = phys_font * 1.4;
+        let text_top = self.block_y_prefix.get(block_idx).copied().unwrap_or(0.0) + 4.0 * sc;
+        let vp_top = self.viewport.scroll_offset;
+        let vp_bot = vp_top + self.viewport.height;
+        let first = ((vp_top - text_top).max(0.0) / line_h).floor() as usize;
+        let last = (((vp_bot - text_top).max(0.0) / line_h).ceil() as usize).min(total_lines);
+        let end = cached_start.saturating_add(shape_len).min(total_lines);
+        cached_start <= first && last <= end
     }
 
     /// Build a GlyphBuffer for a single terminal row with per-character colors.
