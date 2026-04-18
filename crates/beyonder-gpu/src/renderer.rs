@@ -2923,12 +2923,11 @@ impl Renderer {
                                         let is_streaming =
                                             matches!(block.status, BlockStatus::Running);
                                         let throttle_ok = is_streaming
-                                            && self
-                                                .running_shape_at
-                                                .get(&block.id)
-                                                .is_some_and(|t| {
+                                            && self.running_shape_at.get(&block.id).is_some_and(
+                                                |t| {
                                                     t.elapsed().as_millis() < RUNNING_RESHAPE_MIN_MS
-                                                });
+                                                },
+                                            );
                                         // Reuse cache if content+layout match AND the cached
                                         // shape window still covers the viewport-visible slice.
                                         // `served_len` is what we re-key the cache with so a
